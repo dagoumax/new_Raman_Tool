@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local analysis outputs
+_sif*_output.txt
+_sif_*.txt
+_sif_analysis.json
+# Local scratch/debug scripts
+analyze_sif*.py
+launch_raman_tool_hidden.vbs
+
+# Large local camera frames
+test_data/TS_*.tif
