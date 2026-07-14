@@ -6,6 +6,7 @@
 
 from pathlib import Path
 import numpy as np
+from raman_tool.safety import check_data_points, check_text_file_size
 from raman_tool.models import Spectrum
 
 
@@ -23,6 +24,7 @@ def read_txt(
         Spectrum 对象
     """
     filepath = Path(filepath)
+    check_text_file_size(filepath)
     data = np.loadtxt(filepath, comments=("#", ";"))
 
     if data.ndim == 0 or len(data) == 0:
@@ -45,6 +47,8 @@ def read_txt(
             is_index_axis = True
     else:
         raise ValueError(f"TXT 数据格式不支持 (ndim={data.ndim}): {filepath}")
+
+    check_data_points(len(intensity), "TXT data")
 
     if calibration and is_index_axis:
         raman_shift = calibration[0] * raman_shift + calibration[1]

@@ -7,6 +7,7 @@
 from pathlib import Path
 import re
 import numpy as np
+from raman_tool.safety import check_data_points, check_text_file_size
 from raman_tool.models import Spectrum
 
 
@@ -24,6 +25,7 @@ def read_asc(
         Spectrum 对象
     """
     filepath = Path(filepath)
+    check_text_file_size(filepath)
     content = filepath.read_text(encoding="utf-8", errors="ignore")
     lines = content.strip().splitlines()
     data_rows = []
@@ -66,6 +68,8 @@ def read_asc(
     mask = ~np.isnan(intensity)
     raman_shift = raman_shift[mask]
     intensity = intensity[mask]
+
+    check_data_points(len(intensity), "ASC data")
 
     if calibration and is_index_axis:
         raman_shift = calibration[0] * raman_shift + calibration[1]

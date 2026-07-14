@@ -13,21 +13,10 @@ import numpy as np
 from raman_tool.models import Spectrum
 
 
-GAS_RAMAN_SHIFTS = {
-    "N2": {"center": 2330.0, "half_width": 20.0, "coefficient": 1.0, "name": "氮气"},
-    "O2": {"center": 1555.0, "half_width": 25.0, "coefficient": 1.0, "name": "氧气"},
-    "CO2": {"center": 1388.0, "half_width": 15.0, "coefficient": 1.0, "name": "二氧化碳"},
-    # Extra gases are kept for compatibility with the old single-gas API.
-    "H2O": {"center": 3657.0, "half_width": 25.0, "coefficient": 1.0, "name": "水蒸气"},
-    "CH4": {"center": 2917.0, "half_width": 25.0, "coefficient": 1.0, "name": "甲烷"},
-    "H2": {"center": 4155.0, "half_width": 25.0, "coefficient": 1.0, "name": "氢气"},
-    "CO": {"center": 2143.0, "half_width": 25.0, "coefficient": 1.0, "name": "一氧化碳"},
-    "SO2": {"center": 1151.0, "half_width": 25.0, "coefficient": 1.0, "name": "二氧化硫"},
-    "NO": {"center": 1876.0, "half_width": 25.0, "coefficient": 1.0, "name": "一氧化氮"},
-    "NH3": {"center": 3334.0, "half_width": 25.0, "coefficient": 1.0, "name": "氨气"},
-    "C2H6": {"center": 2954.0, "half_width": 25.0, "coefficient": 1.0, "name": "乙烷"},
-}
+from raman_tool.gas_library import DEFAULT_GAS_LIBRARY, find_gas_key, get_gas_library, get_quantitative_gases
 
+
+GAS_RAMAN_SHIFTS = DEFAULT_GAS_LIBRARY
 CONCENTRATION_GASES = ("O2", "N2", "CO2")
 
 
@@ -98,10 +87,15 @@ def calculate_gas_concentrations(
     x = np.asarray(spectrum.raman_shift, dtype=np.float64)
     y = np.asarray(spectrum.intensity, dtype=np.float64)
 
+    gas_library = get_gas_library()
+    concentration_gases = get_quantitative_gases()
+
     peaks: dict[str, dict] = {}
     corrected: dict[str, float] = {}
-    for gas in CONCENTRATION_GASES:
-        info = GAS_RAMAN_SHIFTS[gas]
+    for gas in concentration_gases:
+        if gas not in gas_library:
+            continue
+        info = gas_library[gas]
         center = float(info["center"])
         half_width = float(info["half_width"])
         if windows and gas in windows:
@@ -121,9 +115,9 @@ def calculate_gas_concentrations(
     denominator = float(sum(corrected.values()))
     fractions = {
         gas: (corrected[gas] / denominator if denominator > 1e-15 else 0.0)
-        for gas in CONCENTRATION_GASES
+        for gas in concentration_gases
     }
-    percentages = {gas: fractions[gas] * 100.0 for gas in CONCENTRATION_GASES}
+    percentages = {gas: fractions[gas] * 100.0 for gas in concentration_gases}
 
     return {
         "strategy": strategy,
@@ -148,21 +142,23 @@ def calculate_concentration(
     ``reference_gas`` and ``reference_concentration`` are accepted for backward
     compatibility but are no longer used by the O2/N2/CO2 normalized model.
     """
-    gas_key = gas_name.upper()
-    gas_info = GAS_RAMAN_SHIFTS.get(gas_key)
+    gas_library = get_gas_library()
+    concentration_gases = get_quantitative_gases()
+    gas_key = find_gas_key(gas_name, gas_library)
+    gas_info = gas_library.get(gas_key) if gas_key else None
     if gas_info is None:
-        raise ValueError(f"未知气体: {gas_name}. 支持的气体: {list(GAS_RAMAN_SHIFTS.keys())}")
+        raise ValueError(f"未知气体: {gas_name}. 支持的气体: {list(gas_library.keys())}")
 
     windows = None
-    if gas_key in CONCENTRATION_GASES:
+    if gas_key in concentration_gases:
         windows = {gas_key: (float(gas_info["center"]), float(window))}
 
     all_result = calculate_gas_concentrations(spectrum, strategy=strategy, windows=windows)
     peak = all_result["peaks"].get(gas_key, {"center": 0.0, "area": 0.0, "height": 0.0, "intensity": 0.0})
     concentration = all_result["percentages"].get(gas_key, 0.0)
 
-    ref_key = reference_gas.upper()
-    ref_info = GAS_RAMAN_SHIFTS.get(ref_key, {"name": reference_gas})
+    ref_key = find_gas_key(reference_gas, gas_library) or str(reference_gas)
+    ref_info = gas_library.get(ref_key, {"name": reference_gas})
     ref_peak = all_result["peaks"].get(ref_key, {"center": 0.0, "area": 0.0, "height": 0.0, "intensity": 0.0})
 
     return {
@@ -192,7 +188,9 @@ def calculate_concentration_from_ratio(
     The GUI now uses normalized O2/N2/CO2 concentrations, but this helper is
     kept for existing scripts that pass a precomputed target/reference ratio.
     """
-    gas_info = GAS_RAMAN_SHIFTS.get(gas_name.upper())
+    library = get_gas_library()
+    gas_key = find_gas_key(gas_name, library)
+    gas_info = library.get(gas_key) if gas_key else None
     if gas_info is None:
         raise ValueError(f"未知气体: {gas_name}")
     return reference_concentration * area_ratio

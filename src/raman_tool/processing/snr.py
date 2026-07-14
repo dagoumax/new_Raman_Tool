@@ -5,27 +5,14 @@ from scipy.signal import find_peaks
 from raman_tool.models import Spectrum
 
 # 气体参考峰 (cm⁻¹)
-GAS_REF_PEAKS = {
-    2331.0: "N2",
-    1555.0: "O2",
-    1388.0: "CO2",
-    3657.0: "H2O",
-    2917.0: "CH4",
-    4155.0: "H2",
-    2143.0: "CO",
-    1151.0: "SO2",
-    1876.0: "NO",
-    3334.0: "NH3",
-    2954.0: "C2H6",
-    1285.0: "CO2",
-}
+from raman_tool.gas_library import get_reference_peaks
 
 
 def _match_gas(position: float, tolerance: float) -> str | None:
     """将实测峰位匹配到最近的气体参考峰."""
     best_gas = None
     best_dist = float("inf")
-    for ref_pos, gas_name in GAS_REF_PEAKS.items():
+    for ref_pos, gas_name in get_reference_peaks().items():
         dist = abs(position - ref_pos)
         if dist < tolerance and dist < best_dist:
             best_dist = dist

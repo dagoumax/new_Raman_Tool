@@ -8,6 +8,7 @@ import numpy as np
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from raman_tool.models import Spectrum
+from raman_tool.safety import check_baseline_points
 
 
 def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6) -> np.ndarray:
@@ -26,6 +27,9 @@ def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6
     """
     y = np.asarray(y, dtype=np.float64).flatten()
     N = len(y)
+    if N < 3:
+        raise ValueError("arPLS requires at least 3 data points")
+    check_baseline_points(N)
 
     # 稀疏二阶差分矩阵
     D = diags([1, -2, 1], [0, 1, 2], shape=(N - 2, N), format="csc")

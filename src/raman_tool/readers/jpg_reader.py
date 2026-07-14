@@ -6,6 +6,7 @@
 import re
 from pathlib import Path
 import numpy as np
+from raman_tool.safety import check_image_array_values, check_image_pixels, configure_pillow_limits
 from raman_tool.models import Spectrum
 
 
@@ -48,12 +49,15 @@ def read_jpg(
     calibration: tuple[float, float] | None = None,
     row_mode: str = "mean",
 ) -> Spectrum:
-    from PIL import Image
+    Image = configure_pillow_limits()
 
     filepath = Path(filepath)
-    img = Image.open(filepath).convert("L")  # 转灰度
-    arr = np.array(img, dtype=np.float64)
+    with Image.open(filepath) as img:
+        check_image_pixels(*img.size)
+        arr = np.array(img.convert("L"), dtype=np.float64)
     original_shape = arr.shape
+
+    check_image_array_values(arr.size)
 
     if arr.ndim == 1:
         raman = np.arange(len(arr), dtype=np.float64)

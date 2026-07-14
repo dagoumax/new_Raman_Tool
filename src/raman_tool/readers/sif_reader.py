@@ -13,6 +13,7 @@ from pathlib import Path
 import struct
 import re
 import numpy as np
+from raman_tool.safety import check_data_points, check_file_size
 from raman_tool.models import Spectrum
 
 
@@ -119,8 +120,16 @@ def _read_intensity_1d(data: bytes, text: str) -> tuple:
     raise SIFError("无法定位光谱数据区域")
 
 
+def _trim_ascii_zero_trailer(data: bytes, end: int) -> int:
+    """Trim Andor text trailer lines such as ``0\n0\n`` before the XML block."""
+    while end >= 2 and data[end - 2:end] == b"0\n":
+        end -= 2
+    return end
+
+
 def read_sif(filepath: str | Path, calibration: tuple | None = None) -> Spectrum:
     filepath = Path(filepath)
+    check_file_size(filepath)
     data = filepath.read_bytes()
     try:
         text = data.decode("ascii", errors="replace")
@@ -133,6 +142,7 @@ def read_sif(filepath: str | Path, calibration: tuple | None = None) -> Spectrum
     dim_match = re.search(r"\b(\d{3,4})\s+(\d{2,4})\s+(\d+)", text[:600])
     if dim_match:
         expected_pixels = int(dim_match.group(1))
+        check_data_points(expected_pixels, "SIF expected pixels")
     xml_start = data.find(b"<?xml")
     if xml_start == -1:
         xml_start = len(data)
@@ -151,15 +161,27 @@ def read_sif(filepath: str | Path, calibration: tuple | None = None) -> Spectrum
     # Strategy 2: float32 from XML-bounded area (reference tool approach)
     if intensity is None:
         found_float32 = False
+        data_end = _trim_ascii_zero_trailer(data, xml_start)
         if expected_pixels > 100 and xml_start > expected_pixels * 4 + 300:
             data_start = xml_start - expected_pixels * 4
-            vals = struct.unpack_from("<" + str(expected_pixels) + "f", data, data_start)
-            valid_ratio = sum(10 < v < 100000 for v in vals) / expected_pixels
-            if valid_ratio > 0.3:
-                intensity = np.array(vals, dtype=np.float64)
-                num_pixels = expected_pixels
-                fmt = "float32_LE_xml_" + str(expected_pixels) + "px"
-                found_float32 = True
+            if data_end == xml_start and data_start >= 0:
+                vals = struct.unpack_from("<" + str(expected_pixels) + "f", data, data_start)
+                valid_ratio = sum(10 < v < 100000 for v in vals) / expected_pixels
+                if valid_ratio > 0.3:
+                    intensity = np.array(vals, dtype=np.float64)
+                    num_pixels = expected_pixels
+                    fmt = "float32_LE_xml_" + str(expected_pixels) + "px"
+                    found_float32 = True
+            else:
+                num_pixels = (data_end - data_start) // 4
+                data_start = data_end - num_pixels * 4
+                if num_pixels > 100 and data_start >= 0:
+                    vals = struct.unpack_from("<" + str(num_pixels) + "f", data, data_start)
+                    valid_ratio = sum(10 < v < 100000 for v in vals) / num_pixels
+                    if valid_ratio > 0.3:
+                        intensity = np.array(vals, dtype=np.float64)
+                        fmt = "float32_LE_xml_trimmed_" + str(num_pixels) + "px"
+                        found_float32 = True
 
         # Strategy 3: Original "0\n0\n" marker path
         if not found_float32:
@@ -169,7 +191,8 @@ def read_sif(filepath: str | Path, calibration: tuple | None = None) -> Spectrum
             if marker_pos == -1:
                 raise SIFError("无法定位数据起始位置: {}".format(filepath))
             data_start = marker_pos + 4
-            remaining = xml_start - data_start
+            data_end = _trim_ascii_zero_trailer(data, xml_start)
+            remaining = data_end - data_start
             num_floats = remaining // 4
             if num_floats < 10:
                 raise SIFError("数据区域太小: {}".format(filepath))
@@ -179,6 +202,8 @@ def read_sif(filepath: str | Path, calibration: tuple | None = None) -> Spectrum
     else:
         # Strategy 1 worked (uint16 path)
         pass
+
+    check_data_points(num_pixels, "SIF pixels")
 
     # Compute wavelengths and Raman shift
     wavelengths = _compute_wavelength(num_pixels, cal_coeffs)

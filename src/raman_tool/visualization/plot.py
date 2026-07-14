@@ -11,41 +11,31 @@ import numpy as np
 import sys
 from raman_tool.models import Spectrum
 
-# 气体拉曼峰参考数据 (cm⁻¹)
-GAS_PEAKS = {
-    2331.0: "N2",
-    1555.0: "O2",
-    1388.0: "CO2",
-    3657.0: "H2O",
-    2917.0: "CH4",
-    4155.0: "H2",
-    2143.0: "CO",
-    1151.0: "SO2",
-    1876.0: "NO",
-    3334.0: "NH3",
-    2954.0: "C2H6",
-    1285.0: "CO2(v2)",
-}
 
-# 颜色映射
-GAS_COLORS = {
-    "N2": "#2c3e50", "O2": "#e74c3c", "CO2": "#27ae60",
-    "H2O": "#3498db", "CH4": "#8e44ad", "H2": "#f39c12",
-    "CO": "#1abc9c", "SO2": "#c0392b", "NO": "#7f8c8d",
-    "NH3": "#2ecc71", "C2H6": "#d35400",
-}
+def _finalize_figure_layout(fig: plt.Figure, left: float = 0.14) -> None:
+    """Leave stable space for y-axis labels in GUI and exported figures."""
+    try:
+        fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.98))
+    except Exception:
+        pass
+    fig.subplots_adjust(left=left, right=0.98, bottom=0.12, top=0.92)
+
+# 气体拉曼峰参考数据 (cm⁻¹)
+from raman_tool.gas_library import get_reference_peaks, get_gas_colors
 
 
 def _add_gas_peaks(ax, x_min: float, x_max: float, detected_positions: set | None = None):
     """在坐标轴上叠加参考气体峰位 (淡虚线，仅显示未被自动匹配的气体)."""
     y_min, y_max = ax.get_ylim()
-    for pos, name in sorted(GAS_PEAKS.items()):
+    gas_peaks = get_reference_peaks()
+    gas_colors = get_gas_colors()
+    for pos, name in sorted(gas_peaks.items()):
         if not (x_min <= pos <= x_max):
             continue
         # 如果该位置已有实测峰匹配，跳过参考线（避免重复标注）
         if detected_positions and pos in detected_positions:
             continue
-        color = GAS_COLORS.get(name, "#999")
+        color = gas_colors.get(name, "#999")
         ax.axvline(pos, color=color, linestyle=":", linewidth=0.6, alpha=0.4)
         ax.text(pos, y_max * 0.92, name, color=color, fontsize=6,
                 ha="center", va="top", rotation=90, alpha=0.7,
@@ -64,8 +54,7 @@ def _add_detected_peaks(ax, peaks: list[dict], x_min: float, x_max: float):
         gas = p.get("matched_gas")
         if gas:
             # 已匹配气体: 用该气体颜色 + 名称
-            from raman_tool.visualization.plot import GAS_COLORS
-            color = GAS_COLORS.get(gas, "#e67e22")
+            color = get_gas_colors().get(gas, "#e67e22")
             # 圆点标记峰顶
             ax.plot(cx, ch, "o", color=color, markersize=6, zorder=5,
                     markeredgecolor="white", markeredgewidth=0.8)
@@ -172,7 +161,7 @@ def plot_spectrum(
     if detected_peaks:
         _add_detected_peaks(ax, detected_peaks, x_rng_min, x_rng_max)
 
-    fig.tight_layout()
+    _finalize_figure_layout(fig)
 
     if show:
         plt.show()
@@ -220,7 +209,7 @@ def plot_baseline(
         ax2.set_title("基线校正后")
         ax2.grid(True, alpha=0.3)
 
-    fig.tight_layout()
+    _finalize_figure_layout(fig)
 
     if show:
         plt.show()
@@ -272,7 +261,7 @@ def plot_multiple(
         ax.set_title(title)
     ax.legend()
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    _finalize_figure_layout(fig)
 
     if show:
         plt.show()

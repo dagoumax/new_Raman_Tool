@@ -1,169 +1,148 @@
-﻿# Raman Tool 拉曼光谱数据处理工具
+# Raman Tool
 
-Raman Tool 是一个用于拉曼光谱数据读取、可视化、信噪比计算、基线校正、气体浓度分析和批量处理的桌面/命令行工具。
+Raman Tool is a local Raman spectroscopy data processing application. The project now keeps a single desktop GUI: the Qt interface built with PySide6. Command-line and terminal workflows remain available for scripting and batch processing.
 
-## 功能
+## Features
 
-- 多格式读取：TXT、ASC、SIF、TIFF、BMP
-- 数据可视化：绘制光谱图，支持 PNG/PDF/SVG 导出
-- 基线校正：支持多项式拟合和 airPLS 算法
-- 信噪比计算：可指定信号区域和噪声区域
-- 气体浓度分析：支持 N2、O2、CO2、H2、CH4 等气体
-- 批量处理：批量读取并处理目录中的光谱文件
-- 图形界面：Qt 桌面界面，支持拖拽导入
-- 命令行：适合脚本化和批处理
+- Qt desktop GUI for loading, viewing, processing, and exporting spectra.
+- CLI commands for plotting, batch processing, SNR calculation, baseline correction, concentration analysis, and file inspection.
+- Terminal UI for lightweight interactive workflows.
+- Supported input formats: `.txt`, `.asc`, `.sif`, `.tif`, `.tiff`, `.bmp`, `.jpg`, `.jpeg`.
+- Image import options for row groups, column merging, calibration, and mean/sum row mode.
+- Workflow presets for reusable baseline, concentration, batch, and display settings.
+- Configurable gas Raman peak library for reference markers, automatic peak matching, and concentration windows.
+- Safety limits for very large files, oversized images, excessive data points, and expensive baseline correction.
+- Export protection: existing outputs are not overwritten by default; GUI exports ask for confirmation.
 
-## 系统要求
+## Requirements
 
-- Python >= 3.10
-- Windows / Linux / macOS
-- 推荐使用 uv 管理依赖
+- Python 3.10 or newer
+- Windows, Linux, or macOS
+- `uv` is recommended for dependency management
 
-## 安装
+## Installation
 
-### 1. 安装 uv
+Install `uv` from the official Astral documentation:
 
-Windows PowerShell:
+<https://docs.astral.sh/uv/getting-started/installation/>
+
+For better supply-chain safety, review installer scripts before running them and prefer pinned/locked installs when distributing the tool.
+
+Clone or copy the project, then install dependencies:
 
 ```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Linux/macOS:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### 2. 克隆项目
-
-```bash
-git clone <your-repo-url>
 cd Raman_tool
-```
-
-### 3. 创建虚拟环境并安装依赖
-
-推荐安装 Qt 图形界面依赖：
-
-```bash
 uv sync --extra qt
 ```
 
-如果只需要基础命令行功能：
+For development and tests:
 
-```bash
-uv sync
+```powershell
+uv sync --extra qt --extra dev
 ```
 
-## 启动方式
+## Start The Qt GUI
 
-### Qt 图形界面
-
-```bash
+```powershell
 uv run raman-tool-qt
 ```
 
-或：
+Equivalent module command:
 
-```bash
+```powershell
 uv run python -m raman_tool qt
 ```
 
-### 命令行
-
-```bash
-uv run raman-tool --help
-```
-
-常用示例：
-
-```bash
-uv run raman-tool plot data/spectrum.txt
-uv run raman-tool batch data/ --baseline -o output/
-uv run raman-tool snr data/spectrum.txt --peak 2300,2350 --noise 3500,4000
-uv run raman-tool baseline data/spectrum.txt -m poly -d 3
-uv run raman-tool concentration data/spectrum.txt H2 --ref N2 --ref-conc 78.0
-uv run raman-tool info data/spectrum.txt
-```
-
-## Windows 创建桌面快捷启动方式
-
-仓库中提供了两个文件用于无终端启动：
-
-- `launch_raman_tool.pyw`：真正启动 Qt GUI 的无控制台脚本
-- `create_shortcut.ps1`：自动在桌面创建快捷方式
-
-### 推荐方式：运行脚本自动创建
-
-在项目根目录运行：
+On Windows, the repository also includes a no-console launcher:
 
 ```powershell
 uv sync --extra qt
 powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 ```
 
-运行成功后，桌面会出现：
+This creates a desktop shortcut that starts:
 
 ```text
-Raman Tool 快速启动.lnk
+pythonw.exe -> launch_raman_tool.pyw -> raman_tool.qt_gui
 ```
 
-双击该快捷方式即可启动图形界面。
+## Command Line
 
-### 为什么不用 .venv\Scripts\pythonw.exe
+Show help:
 
-如果虚拟环境由 uv 创建，`.venv\Scripts\pythonw.exe` 可能是一个轻量转发启动器。部分 Windows 环境会把它当成控制台程序处理，导致启动 GUI 时额外弹出黑色终端窗口。
-
-`create_shortcut.ps1` 会读取 `.venv\pyvenv.cfg` 中的 `home = ...`，优先找到 uv 安装的真实 Python GUI 解释器：
-
-```text
-<python-home>\pythonw.exe
+```powershell
+uv run raman-tool --help
 ```
 
-快捷方式最终使用：
+Common examples:
 
-```text
-真实 pythonw.exe -> launch_raman_tool.pyw -> raman_tool.qt_gui
+```powershell
+uv run raman-tool plot test_data\demo.txt
+uv run raman-tool plot test_data\demo.txt --overwrite
+uv run raman-tool batch test_data --baseline -o output
+uv run raman-tool snr test_data\demo.txt --peak 2300,2350 --noise 3500,4000
+uv run raman-tool baseline test_data\demo.txt -m poly -d 3
+uv run raman-tool concentration test_data\demo.txt H2 --ref N2 --ref-conc 78.0
+uv run raman-tool info test_data\demo.txt
+uv run raman-tool tui
+uv run raman-tool qt
 ```
 
-这样可以避免启动时出现终端窗口。
+Output files are protected from accidental overwrite by default. Use `--overwrite` on commands that support it when replacing an existing output is intended.
 
-### 手动创建快捷方式
+## Supported Formats
 
-如果需要手动创建，右键桌面新建快捷方式：
-
-目标填写真实的 `pythonw.exe`，例如：
-
-```text
-C:\Users\你的用户名\AppData\Roaming\uv\python\cpython-3.10-windows-x86_64-none\pythonw.exe
-```
-
-参数填写：
-
-```text
-"C:\path\to\Raman_tool\launch_raman_tool.pyw"
-```
-
-起始位置填写项目根目录：
-
-```text
-C:\path\to\Raman_tool
-```
-
-真实 `pythonw.exe` 的路径可以从 `.venv\pyvenv.cfg` 的 `home = ...` 找到。
-
-## 支持的文件格式
-
-| 格式 | 描述 |
+| Format | Description |
 | --- | --- |
-| `.txt` | 两列文本数据，通常为拉曼位移和强度 |
-| `.asc` | ASC 文本数据 |
-| `.sif` | Andor Solis 光谱文件 |
-| `.tif` / `.tiff` | TIFF 图像 |
-| `.bmp` | BMP 图像 |
+| `.txt` | Text spectrum data, either one intensity column or at least two columns `(x, intensity)` |
+| `.asc` | ASC text data; non-numeric header lines are skipped |
+| `.sif` | Andor Solis SIF spectra |
+| `.tif` / `.tiff` | TIFF image spectra |
+| `.bmp` | BMP image spectra |
+| `.jpg` / `.jpeg` | JPEG image spectra |
 
-## 项目结构
+## Configuration
+
+Runtime settings are stored in a TOML file. By default the app uses `%APPDATA%\\RamanTool\\config.toml` on Windows and `~/.raman_tool/config.toml` elsewhere. Set `RAMAN_TOOL_CONFIG` to point to a custom config file.
+
+In the Qt GUI, open `设置 -> 安全限制...` to edit the main safety limits.
+
+Workflow presets are stored next to the config file as `presets.json` by default. Set `RAMAN_TOOL_PRESETS` to use a custom preset file. In the Qt GUI, use `预设 -> 应用工作流预设...` or `预设 -> 保存当前为预设...`.
+
+The gas peak library is stored next to the config file as `gas_library.json` by default. Set `RAMAN_TOOL_GAS_LIBRARY` to use a custom library file. In the Qt GUI, open `设置 -> 气体峰位库...`.
+
+## Workflow Presets
+
+Workflow presets capture frequently changed processing settings:
+
+- Baseline method, arPLS lambda, polynomial degree, and automatic baseline toggles
+- Concentration focus gas, peak window, and peak height/area strategy
+- Batch baseline toggle
+- Image row mode, column merge factor, gas peak markers, and automatic peak markers
+
+Built-in presets include `标准气体分析`, `峰面积定量`, and `快速查看`. User presets saved from the Qt GUI are written to `presets.json`.
+
+## Gas Peak Library
+
+The configurable gas peak library controls reference peak markers, automatic peak-to-gas matching, the default concentration windows, and batch quantitative outputs. Each gas entry contains a case-preserving key such as `CBrF₃`, display name, Raman peak center, half-window width, correction coefficient, color, enabled flag, and quantitative flag.
+
+`O2`, `N2`, and `CO2` are quantitative by default. Any additional gas marked as quantitative is included in batch concentration curves and TXT exports.
+
+## Safety Limits
+
+Default safety limits are defined in `src/raman_tool/config.py` and loaded through `src/raman_tool/safety.py`.
+
+- Maximum generic input file size: `512 MB`
+- Maximum text input file size: `128 MB`
+- Maximum spectrum data points: `2,000,000`
+- Minimum supported image size target: `2048 x 2048`
+- Current image pixel limit: `4096 x 4096`
+- Image array value limit: pixel limit times 4 channels
+- Maximum arPLS baseline points: `200,000`
+
+These limits are intended to prevent accidental memory or CPU exhaustion when opening malformed or unexpectedly large files.
+
+## Project Layout
 
 ```text
 Raman_tool/
@@ -175,8 +154,8 @@ Raman_tool/
 │   └── raman_tool/
 │       ├── cli.py
 │       ├── qt_gui.py
-│       ├── gui.py
 │       ├── tui.py
+│       ├── safety.py
 │       ├── readers/
 │       ├── processing/
 │       └── visualization/
@@ -184,19 +163,17 @@ Raman_tool/
 └── test_data/
 ```
 
-## 测试
+## Tests
 
-```bash
+```powershell
 uv run pytest
 ```
 
-## 迁移到其他电脑
+The current test suite covers core models, readers, processing, sorting, exporters, and safety limits.
 
-1. 安装 Python 3.10+ 和 uv
-2. 克隆仓库
-3. 在项目根目录运行 `uv sync --extra qt`
-4. Windows 用户运行 `powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1`
-5. 使用桌面快捷方式启动，或运行 `uv run raman-tool-qt`
+## GUI Policy
+
+Only the Qt desktop GUI is maintained. Start it with `raman-tool-qt` or `raman-tool qt`.
 
 ## License
 

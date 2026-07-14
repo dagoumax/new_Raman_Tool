@@ -1,4 +1,4 @@
-﻿"""命令行接口(CLI).
+"""命令行接口(CLI).
 
 提供批量处理、单文件分析、信噪比计算、浓度计算等功能。
 用法:
@@ -8,7 +8,7 @@
     raman-tool baseline <file> [--method arPLS] [--lam 1e5]
     raman-tool concentration <file> <gas> [--ref N2]
     raman-tool info <file> [--row-groups X] [--col-merge N]
-    raman-tool tui / qt / gui
+    raman-tool tui / qt
 """
 
 import argparse
@@ -16,12 +16,21 @@ import sys
 from pathlib import Path
 from raman_tool.models import Spectrum
 from raman_tool.readers import read_file, SUPPORTED_FORMATS
+from raman_tool.sorting import natural_sorted
 from raman_tool.processing import (
     calculate_snr,
     calculate_concentration,
     subtract_baseline,
 )
 from raman_tool.visualization import plot_spectrum, plot_baseline, plot_multiple, save_figure
+from raman_tool.exporters import unique_path
+
+
+def _resolve_output_path(path: Path | str, overwrite: bool = False) -> Path:
+    path = Path(path)
+    if overwrite or not path.exists():
+        return path
+    return unique_path(path)
 
 
 def _load_spectrum(args: argparse.Namespace) -> Spectrum:
@@ -49,11 +58,11 @@ def cmd_plot(args: argparse.Namespace) -> int:
 
     fig = plot_spectrum(spectrum, show=not args.no_show)
     if args.output:
-        path = save_figure(fig, args.output)
+        path = save_figure(fig, _resolve_output_path(args.output, args.overwrite))
         print(f"图表已保存 {path}")
     else:
         out = filepath.with_suffix(".png")
-        path = save_figure(fig, out)
+        path = save_figure(fig, _resolve_output_path(out, args.overwrite))
         print(f"图表已保存 {path}")
 
     return 0
@@ -70,8 +79,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
     supported_exts = set(SUPPORTED_FORMATS.keys())
     all_files = []
     for ext in supported_exts:
-        all_files.extend(sorted(directory.glob(f"*{ext}")))
-        all_files.extend(sorted(directory.glob(f"*{ext.upper()}")))
+        all_files.extend(directory.glob(f"*{ext}"))
+        all_files.extend(directory.glob(f"*{ext.upper()}"))
+    all_files = natural_sorted(all_files)
 
     if not all_files:
         print(f"错误: 在{directory} 中未找到支持格式的文件", file=sys.stderr)
@@ -89,7 +99,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             if args.baseline:
                 spectrum = subtract_baseline(spectrum, method="arPLS")
             fig = plot_spectrum(spectrum, show=False)
-            out_path = out_dir / f"{filepath.stem}.png"
+            out_path = _resolve_output_path(out_dir / f"{filepath.stem}.png", args.overwrite)
             save_figure(fig, out_path)
             ok += 1
             print(f"  OK {filepath.name}")
@@ -150,7 +160,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 
     fig = plot_baseline(spectrum, baseline=baseline, corrected=corrected, show=not args.no_show)
     out = Path(args.output) if args.output else filepath.with_stem(f"{filepath.stem}_baseline").with_suffix(".png")
-    path = save_figure(fig, out)
+    path = save_figure(fig, _resolve_output_path(out, args.overwrite))
     print(f"图表已保存 {path}")
     return 0
 
@@ -230,6 +240,7 @@ def main(args_list: list[str] | None = None) -> int:
     p_plot.add_argument("-o", "--output", help="输出图片路径")
     p_plot.add_argument("-r", "--range", help="拉曼位移范围 (start,end)")
     p_plot.add_argument("--no-show", action="store_true", help="不显示图表")
+    p_plot.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
     _add_tif_args(p_plot)
 
     # batch
@@ -237,6 +248,7 @@ def main(args_list: list[str] | None = None) -> int:
     p_batch.add_argument("directory", help="包含数据文件的目录")
     p_batch.add_argument("-o", "--output", help="输出目录 (默认: output/)")
     p_batch.add_argument("--baseline", action="store_true", help="执行基线校正 (arPLS)")
+    p_batch.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
 
     # snr
     p_snr = subparsers.add_parser("snr", help="计算信噪比")
@@ -253,6 +265,7 @@ def main(args_list: list[str] | None = None) -> int:
     p_bl.add_argument("--lam", type=float, default=1e5, help="arPLS 平滑参数 (默认 1e5)")
     p_bl.add_argument("-o", "--output", help="输出图片路径")
     p_bl.add_argument("--no-show", action="store_true", help="不显示图表")
+    p_bl.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
     _add_tif_args(p_bl)
 
     # concentration
@@ -269,9 +282,8 @@ def main(args_list: list[str] | None = None) -> int:
     p_info.add_argument("file", help="光谱文件路径")
     _add_tif_args(p_info)
 
-    # gui / tui / qt
-    subparsers.add_parser("gui", help="启动 tkinter 界面")
-    subparsers.add_parser("tui", help="启动 终端交互界面")
+    # tui / qt
+    subparsers.add_parser("tui", help="启动终端交互界面")
     subparsers.add_parser("qt", help="启动 Qt 桌面界面")
 
     args = parser.parse_args(args_list)
@@ -284,10 +296,6 @@ def main(args_list: list[str] | None = None) -> int:
         "concentration": cmd_concentration,
         "info": cmd_info,
     }
-
-    if args.command == "gui":
-        from raman_tool.gui import main as gui_main
-        return gui_main()
 
     if args.command == "tui":
         from raman_tool.tui import main as tui_main
