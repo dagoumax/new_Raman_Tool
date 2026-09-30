@@ -87,7 +87,7 @@ if sys.platform == "win32":
 def plot_spectrum(
     spectrum: Spectrum,
     title: str | None = None,
-    xlabel: str = "拉曼位移 (cm-1)",
+    xlabel: str | None = None,
     ylabel: str = "强度 (a.u.)",
     color: str = "steelblue",
     linewidth: float = 0.8,
@@ -139,7 +139,7 @@ def plot_spectrum(
         ax.plot(spectrum.raman_shift, spectrum.intensity,
                 color=color, linewidth=linewidth)
 
-    ax.set_xlabel(xlabel)
+    ax.set_xlabel(xlabel or spectrum.x_plot_label)
     ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title)
@@ -151,7 +151,7 @@ def plot_spectrum(
     x_rng_max = float(np.max(spectrum.raman_shift))
 
     # 参考气体峰位标注 (淡虚线, 跳过已匹配的)
-    if show_gas_peaks:
+    if show_gas_peaks and spectrum.is_raman_shift:
         detected_positions = None
         if detected_peaks:
             detected_positions = {p["center"] for p in detected_peaks if p.get("matched_gas")}
@@ -204,7 +204,7 @@ def plot_baseline(
     if corrected is not None:
         ax2 = axes[1]
         ax2.plot(corrected.raman_shift, corrected.intensity, "g-", linewidth=0.8)
-        ax2.set_xlabel("拉曼位移 (cm-1)")
+        ax2.set_xlabel(corrected.x_plot_label)
         ax2.set_ylabel("强度 (a.u.)")
         ax2.set_title("基线校正后")
         ax2.grid(True, alpha=0.3)
@@ -221,7 +221,7 @@ def plot_multiple(
     spectra: list[Spectrum],
     labels: list[str] | None = None,
     title: str | None = None,
-    xlabel: str = "拉曼位移 (cm-1)",
+    xlabel: str | None = None,
     ylabel: str = "强度 (a.u.)",
     colors: list[str] | None = None,
     figsize: tuple = (12, 6),
@@ -255,7 +255,8 @@ def plot_multiple(
         y_data = spec.intensity + i * offset
         ax.plot(spec.raman_shift, y_data, color=color, linewidth=0.8, label=label)
 
-    ax.set_xlabel(xlabel)
+    inferred_xlabel = spectra[0].x_plot_label if spectra else "X"
+    ax.set_xlabel(xlabel or inferred_xlabel)
     ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title)

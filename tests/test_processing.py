@@ -105,6 +105,16 @@ class TestBaseline:
 
 
 class TestConcentration:
+    def test_rejects_uncalibrated_pixel_axis(self):
+        spec = Spectrum(
+            np.arange(100, dtype=np.float64),
+            np.ones(100, dtype=np.float64),
+            metadata={"x_unit": "px"},
+        )
+
+        with pytest.raises(ValueError, match="校准"):
+            calculate_gas_concentrations(spec)
+
     def test_calculate_gas_concentrations_normalized(self):
         x = np.linspace(100, 4000, 4000)
         o2_peak = 200 * np.exp(-0.5 * ((x - 1555) / 5) ** 2)

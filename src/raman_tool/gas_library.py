@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from raman_tool.config import default_config_path
+from raman_tool.validation import positive_float
+
+
+GAS_PEAK_UNIT = "cm-1"
 
 
 DEFAULT_GAS_LIBRARY: dict[str, dict[str, Any]] = {
@@ -134,13 +138,6 @@ def default_gas_library_path() -> Path:
     return default_config_path().with_name("gas_library.json")
 
 
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _to_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -173,17 +170,16 @@ def _coerce_entry(key: str, raw: dict[str, Any]) -> tuple[str, dict[str, Any]] |
     if not clean_key:
         return None
     default = _default_for_key(clean_key)
-    center = _to_float(raw.get("center", default.get("center", 0.0)), 0.0)
-    half_width = _to_float(raw.get("half_width", default.get("half_width", 25.0)), 25.0)
-    coefficient = _to_float(raw.get("coefficient", default.get("coefficient", 1.0)), 1.0)
-    if center <= 0:
-        return None
+    center = positive_float(raw.get("center", default.get("center", 0.0)), f"{clean_key} center")
+    half_width = positive_float(raw.get("half_width", default.get("half_width", 25.0)), f"{clean_key} half_width")
+    coefficient = positive_float(raw.get("coefficient", default.get("coefficient", 1.0)), f"{clean_key} coefficient")
     return clean_key, {
         "name": str(raw.get("name", default.get("name", clean_key)) or clean_key),
         "label": str(raw.get("label", default.get("label", clean_key)) or clean_key),
+        "x_unit": GAS_PEAK_UNIT,
         "center": center,
-        "half_width": max(0.1, half_width),
-        "coefficient": max(0.0, coefficient),
+        "half_width": half_width,
+        "coefficient": coefficient,
         "color": str(raw.get("color", default.get("color", "#999999")) or "#999999"),
         "enabled": _to_bool(raw.get("enabled", default.get("enabled", True)), True),
         "quantitative": _to_bool(raw.get("quantitative", default.get("quantitative", False)), False),
@@ -253,16 +249,10 @@ def reset_gas_library(path: str | Path | None = None) -> Path:
 
 def get_quantitative_gases() -> tuple[str, ...]:
     library = get_gas_library()
-    gases = tuple(
+    return tuple(
         key for key, entry in library.items()
         if entry.get("enabled", True) and entry.get("quantitative", False)
     )
-    if gases:
-        return gases
-    core = tuple(gas for gas in ("O2", "N2", "CO2") if gas in library and library[gas].get("enabled", True))
-    if core:
-        return core
-    return tuple(key for key, entry in library.items() if entry.get("enabled", True))
 
 
 def get_reference_peaks() -> dict[float, str]:
@@ -302,4 +292,13 @@ def get_gas_choices() -> list[tuple[str, str]]:
         (key, f"{key} ({entry.get('name', key)})")
         for key, entry in get_gas_library().items()
         if entry.get("enabled", True)
+    ]
+
+
+def get_quantitative_gas_choices() -> list[tuple[str, str]]:
+    quantitative = set(get_quantitative_gases())
+    return [
+        (key, f"{key} ({entry.get('name', key)})")
+        for key, entry in get_gas_library().items()
+        if key in quantitative
     ]

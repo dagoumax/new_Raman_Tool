@@ -1,23 +1,33 @@
-"""信噪比 (SNR) 计算与寻峰."""
+"""信噪比、峰面积与扣除背景后的半峰宽计算。"""
 
 import numpy as np
-from scipy.signal import find_peaks
-from raman_tool.models import Spectrum
+from scipy.integrate import trapezoid
+from scipy.signal import find_peaks, peak_widths
 
-# 气体参考峰 (cm⁻¹)
+from raman_tool.models import Spectrum
 from raman_tool.gas_library import get_reference_peaks
+from raman_tool.validation import finite_float, integer_parameter, positive_float, region_mask, validate_spectrum_arrays
+
+
+def _ascending(spectrum: Spectrum) -> tuple[np.ndarray, np.ndarray]:
+    x, y = validate_spectrum_arrays(spectrum.raman_shift, spectrum.intensity)
+    return (x[::-1], y[::-1]) if x[0] > x[-1] else (x, y)
 
 
 def _match_gas(position: float, tolerance: float) -> str | None:
-    """将实测峰位匹配到最近的气体参考峰."""
     best_gas = None
     best_dist = float("inf")
     for ref_pos, gas_name in get_reference_peaks().items():
         dist = abs(position - ref_pos)
         if dist < tolerance and dist < best_dist:
-            best_dist = dist
-            best_gas = gas_name
+            best_dist, best_gas = dist, gas_name
     return best_gas
+
+
+def _optional_region(x, start, end, name, minimum):
+    if (start is None) != (end is None):
+        raise ValueError(f"{name} requires both start and end")
+    return None if start is None else region_mask(x, start, end, name=name, minimum=minimum)
 
 
 def calculate_snr(
@@ -27,109 +37,68 @@ def calculate_snr(
     noise_start: float | None = None,
     noise_end: float | None = None,
 ) -> dict:
-    """计算光谱的信噪比 (SNR).
+    """峰高（区域最大值减最小值）除以噪声区域的标准差。
 
-    信噪比 = 峰值信号强度 / 噪声 RMS
-
-    Args:
-        spectrum: 输入光谱
-        peak_start: 信号区域起始拉曼位移 (cm⁻¹)，None 时自动选择最高峰
-        peak_end: 信号区域终止拉曼位移 (cm⁻¹)
-        noise_start: 噪声区域起始拉曼位移 (cm⁻¹)，None 时自动选择平坦区域
-        noise_end: 噪声区域终止拉曼位移 (cm⁻¹)
-
-    Returns:
-        dict: {"snr": 信噪比值, "signal": 信号强度, "noise_rms": 噪声RMS,
-               "peak_center": 峰值位置, "peak_area": 峰面积}
+    默认噪声选区为横坐标最高的 10% 数据点（至少 2 点），与文件顺序无关。
+    平坦信号不具备可用 SNR；有信号且噪声为零时返回无穷大。
     """
-    x = spectrum.raman_shift
-    y = spectrum.intensity
-
-    if peak_start is not None and peak_end is not None:
-        peak_mask = (x >= peak_start) & (x <= peak_end)
-        peak_y = y[peak_mask]
-        signal = np.max(peak_y) - np.min(peak_y)
-        peak_center = x[peak_mask][np.argmax(peak_y)]
-        peak_area = np.trapezoid(peak_y - np.min(peak_y), x[peak_mask])
-    else:
-        signal = np.max(y) - np.min(y)
-        peak_center = x[np.argmax(y)]
-        peak_area = 0.0
-
-    if noise_start is not None and noise_end is not None:
-        noise_mask = (x >= noise_start) & (x <= noise_end)
-        noise_y = y[noise_mask]
-        noise_rms = np.std(noise_y)
-    else:
-        # 自动选择噪声区域：光谱最后 10% 的区域
-        n = len(x)
-        noise_start_idx = int(n * 0.9)
-        noise_y = y[noise_start_idx:]
-        noise_rms = np.std(noise_y)
-
-    if noise_rms == 0:
-        snr = float("inf")
-    else:
-        snr = signal / noise_rms
-
+    x, y = _ascending(spectrum)
+    if len(x) < 2:
+        raise ValueError("SNR requires at least 2 data points")
+    peak_mask = _optional_region(x, peak_start, peak_end, "peak region", 2)
+    noise_mask = _optional_region(x, noise_start, noise_end, "noise region", 2)
+    peak_x, peak_y = (x, y) if peak_mask is None else (x[peak_mask], y[peak_mask])
+    signal = float(np.max(peak_y) - np.min(peak_y))
+    if signal <= 0:
+        raise ValueError("peak region has no positive signal above background; SNR is undefined")
+    peak_center = peak_x[np.argmax(peak_y)]
+    peak_area = 0.0 if peak_mask is None else trapezoid(peak_y - np.min(peak_y), peak_x)
+    noise_y = y[-max(2, int(np.ceil(len(x) * 0.1))):] if noise_mask is None else y[noise_mask]
+    noise_rms = float(np.std(noise_y))
+    snr = float("inf") if noise_rms == 0 else signal / noise_rms
     return {
-        "snr": float(snr),
-        "signal": float(signal),
-        "noise_rms": float(noise_rms),
-        "peak_center": float(peak_center),
-        "peak_area": float(peak_area),
+        "snr": float(snr), "signal": signal, "noise_rms": noise_rms,
+        "peak_center": float(peak_center), "peak_area": float(peak_area),
+        "x_unit": spectrum.x_unit,
+        "noise_points": len(noise_y),
+        "noise_region_source": "automatic_high_x_tail" if noise_mask is None else "user",
     }
 
 
-def find_peak(
-    spectrum: Spectrum,
-    start: float,
-    end: float,
-) -> dict:
-    """在指定区域内寻找峰值.
+def _local_fwhm(x, y, idx, baseline):
+    height = float(y[idx] - baseline)
+    if height <= 0:
+        return float("nan"), False
+    half = baseline + height / 2.0
+    left, right = int(idx), int(idx)
+    while left > 0 and y[left] > half:
+        left -= 1
+    while right < len(y) - 1 and y[right] > half:
+        right += 1
+    if y[left] > half or y[right] > half or left == right:
+        return float("nan"), False
+    left_x = float(np.interp(half, y[left:left + 2], x[left:left + 2]))
+    right_x = float(np.interp(half, y[right - 1:right + 1][::-1], x[right - 1:right + 1][::-1]))
+    return right_x - left_x, True
 
-    Args:
-        spectrum: 输入光谱
-        start: 起始拉曼位移
-        end: 终止拉曼位移
 
-    Returns:
-        dict: {"center": 峰中心位置, "height": 峰高, "area": 峰面积,
-               "fwhm": 半峰宽}
-    """
-    x = spectrum.raman_shift
-    y = spectrum.intensity
-
-    mask = (x >= start) & (x <= end)
-    x_roi = x[mask]
-    y_roi = y[mask]
-
-    if len(y_roi) == 0:
-        raise ValueError(f"在范围 [{start}, {end}] 内无数据点")
-
-    idx_max = np.argmax(y_roi)
-    center = x_roi[idx_max]
-    height = y_roi[idx_max]
-
-    baseline = np.min(y_roi)
-    y_baselined = y_roi - baseline
-
-    area = float(np.trapezoid(y_baselined, x_roi))
-
-    # 计算半峰宽 (Full Width at Half Maximum)
-    half_max = height / 2
-    above_half = y_roi >= half_max
-    indices = np.where(above_half)[0]
-    if len(indices) >= 2:
-        fwhm = x_roi[indices[-1]] - x_roi[indices[0]]
-    else:
-        fwhm = 0.0
-
+def find_peak(spectrum: Spectrum, start: float, end: float) -> dict:
+    """在指定区域寻峰；面积扣除区域最小值，半峰宽按同一背景计算。"""
+    x, y = _ascending(spectrum)
+    mask = region_mask(x, start, end, name="peak region", minimum=3)
+    x_roi, y_roi = x[mask], y[mask]
+    idx_max = int(np.argmax(y_roi))
+    baseline = float(np.min(y_roi))
+    height = float(y_roi[idx_max] - baseline)
+    if height <= 0:
+        raise ValueError("peak region has no positive signal above background")
+    fwhm, fwhm_valid = _local_fwhm(x_roi, y_roi, idx_max, baseline)
     return {
-        "center": float(center),
-        "height": float(height - baseline),
-        "area": area,
-        "fwhm": float(fwhm),
+        "center": float(x_roi[idx_max]), "height": height,
+        "area": float(trapezoid(y_roi - baseline, x_roi)),
+        "fwhm": float(fwhm), "fwhm_valid": fwhm_valid,
+        "warnings": [] if fwhm_valid else ["选区未包含峰两侧的半高交点，无法计算半峰宽"],
+        "x_unit": spectrum.x_unit,
     }
 
 
@@ -142,70 +111,54 @@ def find_peaks_auto(
     rel_prominence: float = 0.05,
     match_tolerance: float | None = None,
 ) -> list[dict]:
-    """自动检测光谱中的所有峰，并尝试匹配已知气体。
+    """自动寻峰，使用峰突出度定义半峰宽，并按横坐标升序返回。
 
-    Args:
-        spectrum: 输入光谱
-        height: 峰高阈值，None 时按最大强度的 5% 自动设置
-        distance: 峰之间的最小间距 (像素)
-        prominence: 峰的突出度阈值，None 时自动设置
-        rel_height: 相对高度阈值 (相对于最大强度)
-        rel_prominence: 相对突出度阈值 (相对于最大强度)
-        match_tolerance: 气体匹配容差 (x 轴单位)，None 时取 x 范围的 5%
-
-    Returns:
-        [{center, height, area, fwhm, prominence, matched_gas}, ...] 按位置排序
+    height 保持为原始峰顶强度；面积扣除峰基部端点之间的线性背景。
     """
-    x = spectrum.raman_shift
-    y = spectrum.intensity
-
-    y_max = np.max(y)
-    y_std = np.std(y)
-    x_range = np.max(x) - np.min(x)
-
+    x, y = _ascending(spectrum)
+    distance = integer_parameter(distance, "distance", minimum=1)
+    rel_height = finite_float(rel_height, "rel_height")
+    rel_prominence = finite_float(rel_prominence, "rel_prominence")
+    if not (0 <= rel_height <= 1 and 0 <= rel_prominence <= 1):
+        raise ValueError("relative peak thresholds must be between 0 and 1")
+    if height is not None:
+        height = finite_float(height, "height")
+    if prominence is not None:
+        prominence = finite_float(prominence, "prominence")
+        if prominence < 0:
+            raise ValueError("prominence must be >= 0")
+    if match_tolerance is not None:
+        match_tolerance = positive_float(match_tolerance, "match_tolerance")
+    if len(x) < 3:
+        return []
+    y_span = float(np.max(y) - np.min(y))
+    y_std = float(np.std(y))
     if height is None:
-        height = max(y_std * 2, y_max * rel_height)
+        height = float(np.min(y)) + max(y_std * 2, y_span * rel_height)
     if prominence is None:
-        prominence = max(y_std, y_max * rel_prominence)
+        prominence = max(y_std, y_span * rel_prominence)
     if match_tolerance is None:
-        match_tolerance = max(50, x_range * 0.05)
-
-    peaks_idx, props = find_peaks(
-        y, height=height, distance=distance, prominence=prominence
+        match_tolerance = max(50, (x[-1] - x[0]) * 0.05)
+    peaks_idx, props = find_peaks(y, height=height, distance=distance, prominence=prominence)
+    if not len(peaks_idx):
+        return []
+    _, _, left_ips, right_ips = peak_widths(
+        y, peaks_idx, rel_height=0.5,
+        prominence_data=(props["prominences"], props["left_bases"], props["right_bases"]),
     )
-
+    point_indices = np.arange(len(x), dtype=float)
     results = []
     for i, idx in enumerate(peaks_idx):
         center = float(x[idx])
-        peak_height = float(y[idx])
-
-        half_max = peak_height / 2
-        left = idx
-        while left > 0 and y[left] > half_max:
-            left -= 1
-        right = idx
-        while right < len(y) - 1 and y[right] > half_max:
-            right += 1
-        fwhm = float(x[min(right, len(x) - 1)] - x[max(left, 0)])
-
-        area_start = max(0, idx - int(fwhm / (x[1] - x[0]) if len(x) > 1 and x[1] != x[0] else 5))
-        area_end = min(len(y), idx + int(fwhm / (x[1] - x[0]) if len(x) > 1 and x[1] != x[0] else 5))
-        if area_end > area_start:
-            area = float(np.trapezoid(y[area_start:area_end], x[area_start:area_end]))
-        else:
-            area = 0.0
-
-        prom = float(props["prominences"][i]) if "prominences" in props else 0.0
-
-        matched = _match_gas(center, match_tolerance)
-
+        left, right = int(props["left_bases"][i]), int(props["right_bases"][i])
+        area_x, area_y = x[left:right + 1], y[left:right + 1]
+        background = np.interp(area_x, [x[left], x[right]], [y[left], y[right]])
+        area = float(trapezoid(np.maximum(area_y - background, 0.0), area_x))
+        fwhm = float(np.interp(right_ips[i], point_indices, x) - np.interp(left_ips[i], point_indices, x))
         results.append({
-            "center": center,
-            "height": peak_height,
-            "area": area,
-            "fwhm": fwhm,
-            "prominence": prom,
-            "matched_gas": matched,
+            "center": center, "height": float(y[idx]), "area": area,
+            "fwhm": fwhm, "prominence": float(props["prominences"][i]),
+            "matched_gas": _match_gas(center, match_tolerance) if spectrum.is_raman_shift else None,
+            "x_unit": spectrum.x_unit,
         })
-
     return results
