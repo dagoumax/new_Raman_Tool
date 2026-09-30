@@ -13,9 +13,12 @@ from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
 from rich.table import Table
 
 from raman_tool.exporters import unique_path
+from raman_tool.gas_library import get_gas_library, get_quantitative_gas_choices
 from raman_tool.processing import calculate_concentration, calculate_snr, subtract_baseline
 from raman_tool.readers import SUPPORTED_FORMATS, read_file
 from raman_tool.sorting import natural_sorted
+from raman_tool.workflows import collect_spectrum_files, load_spectrum
+from raman_tool.validation import integer_parameter
 from raman_tool.visualization import plot_baseline, plot_spectrum, save_figure
 
 
@@ -112,11 +115,7 @@ class RamanTUI:
             actions[choice]()
 
     def _supported_files(self) -> list[Path]:
-        files: list[Path] = []
-        for ext in SUPPORTED_FORMATS:
-            files.extend(self.work_dir.glob(f"*{ext}"))
-            files.extend(self.work_dir.glob(f"*{ext.upper()}"))
-        return natural_sorted(set(files))
+        return collect_spectrum_files(self.work_dir)
 
     def _browse_files(self) -> None:
         while True:
@@ -161,15 +160,25 @@ class RamanTUI:
             if row_groups:
                 kwargs["row_groups"] = row_groups
             try:
-                kwargs["col_merge"] = max(1, int(Prompt.ask("  列合并因子", default="1").strip()))
-            except ValueError:
-                kwargs["col_merge"] = 1
+                kwargs["col_merge"] = integer_parameter(
+                    Prompt.ask("  列合并因子", default="1").strip(), "列合并", minimum=1,
+                )
+            except ValueError as exc:
+                console.print(f"[red]{exc}[/red]")
+                self._press_enter()
+                return
             if Confirm.ask("  使用行求和模式?", default=False):
                 kwargs["row_mode"] = "sum"
+        if Confirm.ask("  使用像素线性校准 x=a*pixel+b?", default=False):
+            kwargs["calibration"] = (
+                FloatPrompt.ask("  校准斜率 a"),
+                FloatPrompt.ask("  校准截距 b"),
+            )
         try:
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
                 task = progress.add_task(f"[cyan]正在读取 {filepath.name}...", total=None)
-                self.current_spectrum = read_file(filepath, **kwargs)
+                self.current_spectrum = load_spectrum(filepath, **kwargs)
+                self.import_options = kwargs.copy()
                 self.current_path = filepath
                 self.work_dir = filepath.parent
                 progress.update(task, completed=True)
@@ -199,7 +208,10 @@ class RamanTUI:
         table.add_column("值")
         table.add_row("文件名", self.current_file)
         table.add_row("数据点数", str(spec.size))
-        table.add_row("拉曼位移范围", f"{spec.raman_shift[0]:.2f} - {spec.raman_shift[-1]:.2f}")
+        table.add_row(
+            "横轴范围",
+            f"{spec.raman_shift[0]:.2f} - {spec.raman_shift[-1]:.2f} {spec.x_unit_label}",
+        )
         table.add_row("强度最小值", f"{spec.intensity.min():.2f}")
         table.add_row("强度最大值", f"{spec.intensity.max():.2f}")
         table.add_row("强度均值", f"{spec.intensity.mean():.2f}")
@@ -251,18 +263,18 @@ class RamanTUI:
             console.print(f"[red]计算失败: {exc}[/red]")
         self._press_enter()
 
+    def _prompt_baseline_options(self) -> dict:
+        method = Prompt.ask("基线方法", choices=["arPLS", "poly"], default="arPLS")
+        if method == "arPLS":
+            return {"method": method, "lam": FloatPrompt.ask("arPLS 平滑参数", default=1e5)}
+        return {"method": method, "degree": IntPrompt.ask("多项式阶数", default=3)}
+
     def _baseline_correct(self) -> None:
         if not self._require_spectrum():
             return
         spec = self.current_spectrum
-        method = Prompt.ask("基线方法", choices=["arPLS", "poly"], default="arPLS")
         try:
-            if method == "arPLS":
-                lam = FloatPrompt.ask("arPLS 平滑参数", default=1e5)
-                corrected = subtract_baseline(spec, method="arPLS", lam=lam)
-            else:
-                degree = IntPrompt.ask("多项式阶数", default=3)
-                corrected = subtract_baseline(spec, method="poly", degree=degree)
+            corrected = subtract_baseline(spec, **self._prompt_baseline_options())
             baseline = spec.intensity - corrected.intensity
             out = unique_path(self.work_dir / f"{Path(self.current_file).stem}_baseline.png")
             path = save_figure(plot_baseline(spec, baseline=baseline, corrected=corrected, show=False), out)
@@ -276,41 +288,43 @@ class RamanTUI:
     def _calc_concentration(self) -> None:
         if not self._require_spectrum():
             return
-        gases = [
-            ("N2", "氮气"), ("O2", "氧气"), ("CO2", "二氧化碳"),
-            ("H2O", "水蒸气"), ("CH4", "甲烷"), ("H2", "氢气"),
-            ("CO", "一氧化碳"), ("SO2", "二氧化硫"), ("NO", "一氧化氮"),
-            ("NH3", "氨气"), ("C2H6", "乙烷"),
-        ]
+        gases = get_quantitative_gas_choices()
+        if not gases:
+            console.print("[red]气体峰位库中没有启用定量的气体[/red]")
+            self._press_enter()
+            return
         table = Table(box=ROUNDED, show_header=True, header_style="bold cyan")
         table.add_column("#", width=4)
         table.add_column("代码")
         table.add_column("名称")
-        for i, (code, name) in enumerate(gases, 1):
-            table.add_row(str(i), code, name)
+        library = get_gas_library()
+        for i, (code, _label) in enumerate(gases, 1):
+            table.add_row(str(i), code, str(library[code].get("name", code)))
         console.print(Panel(table, title="[bold]气体浓度分析[/bold]", border_style="cyan", box=ROUNDED))
         try:
             gas_idx = IntPrompt.ask("选择目标气体", default=1) - 1
-            ref_idx = IntPrompt.ask("选择参考气体", default=1) - 1
-            if not (0 <= gas_idx < len(gases) and 0 <= ref_idx < len(gases)):
+            if not 0 <= gas_idx < len(gases):
                 raise ValueError("气体编号无效")
-            ref_conc = FloatPrompt.ask("参考气体浓度(%)", default=78.0)
-            window = FloatPrompt.ask("峰搜索窗口", default=10.0)
+            gas_key = gases[gas_idx][0]
+            window = FloatPrompt.ask(
+                "聚焦气体半窗口 (cm⁻¹)",
+                default=float(library[gas_key]["half_width"]),
+            )
             result = calculate_concentration(
                 self.current_spectrum,
-                gas_name=gases[gas_idx][0],
+                gas_name=gas_key,
                 window=window,
-                reference_gas=gases[ref_idx][0],
-                reference_concentration=ref_conc,
+                strategy=Prompt.ask("定量策略", choices=["peak_max", "peak_area"], default="peak_max"),
             )
             result_table = Table(box=ROUNDED, show_header=False, padding=(0, 2))
             result_table.add_row("目标气体", result["gas"])
-            result_table.add_row("浓度", f"{result['concentration']:.4f} %")
-            result_table.add_row("峰中心", f"{result['peak_center']:.2f}")
+            result_table.add_row("归一化信号占比", f"{result['concentration']:.4f} %")
+            result_table.add_row("峰中心", f"{result['peak_center']:.2f} {self.current_spectrum.x_unit_label}")
             result_table.add_row("峰面积", f"{result['peak_area']:.4f}")
-            result_table.add_row("参考气体", result["reference_gas"])
-            result_table.add_row("参考峰", f"{result['reference_peak_center']:.2f}")
-            result_table.add_row("参考面积", f"{result['reference_peak_area']:.4f}")
+            for gas, percentage in result["all_concentrations"]["percentages"].items():
+                result_table.add_row(f"{gas} 信号占比", f"{percentage:.4f} %")
+            for warning in result["all_concentrations"].get("warnings", []):
+                result_table.add_row("说明", warning)
             console.print(Panel(result_table, title="[bold green]浓度计算结果[/bold green]", border_style="green", box=ROUNDED))
         except Exception as exc:
             console.print(f"[red]计算失败: {exc}[/red]")
@@ -327,20 +341,23 @@ class RamanTUI:
         if not out_dir.is_absolute():
             out_dir = self.work_dir / out_dir
         do_baseline = Confirm.ask("执行基线校正?", default=False)
+        baseline_options = self._prompt_baseline_options() if do_baseline else None
         out_dir.mkdir(parents=True, exist_ok=True)
         ok = fail = 0
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
             task = progress.add_task("[cyan]批量处理中...", total=None)
             for file in files:
                 try:
-                    spec = read_file(file)
-                    if do_baseline:
-                        spec = subtract_baseline(spec)
+                    spec = load_spectrum(
+                        file, **getattr(self, "import_options", {}),
+                        baseline_options=baseline_options,
+                    )
                     out = unique_path(out_dir / f"{file.stem}.png")
                     save_figure(plot_spectrum(spec, show=False), out)
                     ok += 1
-                except Exception:
+                except Exception as exc:
                     fail += 1
+                    console.print(f"[red]{file.name}: {exc}[/red]")
             progress.update(task, completed=True)
         console.print(f"[green]完成: {ok} 成功[/green], [red]{fail} 失败[/red], 输出目录: {out_dir}")
         self._press_enter()

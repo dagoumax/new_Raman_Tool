@@ -17,7 +17,15 @@ DEFAULT_CONFIG: dict[str, dict[str, int]] = {
         "max_image_pixels": 4096 * 4096,
         "max_image_channels": 4,
         "max_baseline_points": 200_000,
-    }
+    },
+    "runtime": {
+        "max_history_states": 32,
+        "max_history_mb": 128,
+        "history_display_records": 200,
+        "max_cache_sessions": 16,
+        "max_cache_mb": 256,
+        "max_cache_disk_mb": 1024,
+    },
 }
 
 _config_cache: dict[str, Any] | None = None
@@ -89,6 +97,13 @@ def _coerce_safety(config: dict[str, Any]) -> dict[str, Any]:
         safety["max_image_pixels"],
     )
     safety["max_image_channels"] = max(1, safety["max_image_channels"])
+    runtime = config.setdefault("runtime", {})
+    for key, default in DEFAULT_CONFIG["runtime"].items():
+        try:
+            runtime[key] = max(1, int(runtime.get(key, default)))
+        except (TypeError, ValueError):
+            runtime[key] = default
+    runtime["max_history_states"] = max(2, runtime["max_history_states"])
     return config
 
 
@@ -114,13 +129,16 @@ def reload_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any], path: str | Path | None = None) -> Path:
-    config = _coerce_safety(_deep_merge(DEFAULT_CONFIG, config))
     config_path = Path(path) if path is not None else default_config_path()
+    # A safety-only update must retain separately configured runtime budgets.
+    config = _coerce_safety(_deep_merge(load_config(config_path), config))
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    safety = config["safety"]
-    lines = ["[safety]"]
-    for key in DEFAULT_CONFIG["safety"]:
-        lines.append(f"{key} = {int(safety[key])}")
+    lines = []
+    for section, defaults in DEFAULT_CONFIG.items():
+        lines.append(f"[{section}]")
+        for key in defaults:
+            lines.append(f"{key} = {int(config[section][key])}")
+        lines.append("")
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     global _config_cache
     _config_cache = config

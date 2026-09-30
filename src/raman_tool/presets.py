@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from raman_tool.config import default_config_path
+from raman_tool.validation import positive_float, integer_parameter, calibration_from_points
+from raman_tool.readers.image_reader import _parse_row_groups
 
 
 DEFAULT_WORKFLOW_PRESETS: dict[str, dict[str, Any]] = {
@@ -18,7 +20,7 @@ DEFAULT_WORKFLOW_PRESETS: dict[str, dict[str, Any]] = {
         "baseline_degree": 3,
         "auto_baseline": True,
         "batch_baseline": True,
-        "concentration_gas": "N2",
+        "concentration_gas": "",
         "concentration_window": 10.0,
         "concentration_strategy": "peak_max",
         "row_mode": "mean",
@@ -38,7 +40,7 @@ DEFAULT_WORKFLOW_PRESETS: dict[str, dict[str, Any]] = {
         "baseline_degree": 3,
         "auto_baseline": True,
         "batch_baseline": True,
-        "concentration_gas": "N2",
+        "concentration_gas": "",
         "concentration_window": 12.0,
         "concentration_strategy": "peak_area",
         "row_mode": "mean",
@@ -58,7 +60,7 @@ DEFAULT_WORKFLOW_PRESETS: dict[str, dict[str, Any]] = {
         "baseline_degree": 3,
         "auto_baseline": False,
         "batch_baseline": False,
-        "concentration_gas": "N2",
+        "concentration_gas": "",
         "concentration_window": 10.0,
         "concentration_strategy": "peak_max",
         "row_mode": "mean",
@@ -84,21 +86,7 @@ def default_presets_path() -> Path:
     return default_config_path().with_name("presets.json")
 
 
-def _to_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_bool(value: Any, default: bool) -> bool:
+def _to_bool(value: Any, name: str) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -107,33 +95,51 @@ def _to_bool(value: Any, default: bool) -> bool:
             return True
         if lowered in {"0", "false", "no", "off"}:
             return False
-    return default
+    raise ValueError(f"{name} must be a boolean")
 
 
-def _coerce_preset(raw: dict[str, Any]) -> dict[str, Any]:
+def validate_workflow_preset(raw: dict[str, Any]) -> dict[str, Any]:
+    """Fill omitted defaults and reject values that processing would reject.
+
+    A preset never silently substitutes or clamps explicitly supplied numerical
+    parameters. Spectrum-dependent constraints are checked during processing.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("Workflow preset must be an object")
     preset = deepcopy(DEFAULT_WORKFLOW_PRESETS["标准气体分析"])
     for key, value in raw.items():
         if key in PRESET_KEYS:
             preset[key] = value
 
-    preset["baseline_method"] = "poly" if str(preset["baseline_method"]).lower() == "poly" else "arPLS"
-    preset["baseline_lam"] = max(1.0, _to_float(preset["baseline_lam"], 100000.0))
-    preset["baseline_degree"] = min(5, max(1, _to_int(preset["baseline_degree"], 3)))
-    preset["auto_baseline"] = _to_bool(preset["auto_baseline"], True)
-    preset["batch_baseline"] = _to_bool(preset["batch_baseline"], True)
-    preset["concentration_gas"] = str(preset["concentration_gas"] or "N2").strip() or "N2"
-    preset["concentration_window"] = max(0.1, _to_float(preset["concentration_window"], 10.0))
-    preset["concentration_strategy"] = (
-        "peak_area" if str(preset["concentration_strategy"]) == "peak_area" else "peak_max"
-    )
-    preset["row_mode"] = "sum" if str(preset["row_mode"]) == "sum" else "mean"
-    preset["col_merge"] = max(1, _to_int(preset["col_merge"], 1))
+    method = str(preset["baseline_method"]).lower()
+    if method not in {"poly", "arpls"}:
+        raise ValueError("baseline_method must be arPLS or poly")
+    preset["baseline_method"] = "poly" if method == "poly" else "arPLS"
+    preset["baseline_lam"] = positive_float(preset["baseline_lam"], "baseline_lam")
+    preset["baseline_degree"] = integer_parameter(preset["baseline_degree"], "baseline_degree", minimum=0)
+    preset["auto_baseline"] = _to_bool(preset["auto_baseline"], "auto_baseline")
+    preset["batch_baseline"] = _to_bool(preset["batch_baseline"], "batch_baseline")
+    preset["concentration_gas"] = str(preset["concentration_gas"] or "").strip()
+    preset["concentration_window"] = positive_float(preset["concentration_window"], "concentration_window")
+    if str(preset["concentration_strategy"]) not in {"peak_max", "peak_area"}:
+        raise ValueError("concentration_strategy must be peak_max or peak_area")
+    if str(preset["row_mode"]) not in {"sum", "mean"}:
+        raise ValueError("row_mode must be sum or mean")
+    preset["col_merge"] = integer_parameter(preset["col_merge"], "col_merge", minimum=1)
     preset["row_groups"] = str(preset["row_groups"] or "").strip()
-    preset["show_individual_rows"] = _to_bool(preset["show_individual_rows"], False)
+    if preset["row_groups"]:
+        _parse_row_groups(preset["row_groups"])
+    preset["show_individual_rows"] = _to_bool(preset["show_individual_rows"], "show_individual_rows")
     for key in ("calibration_px1", "calibration_shift1", "calibration_px2", "calibration_shift2"):
-        preset[key] = str(preset[key] or "").strip()
-    preset["show_gas_peaks"] = _to_bool(preset["show_gas_peaks"], True)
-    preset["show_auto_peaks"] = _to_bool(preset["show_auto_peaks"], True)
+        preset[key] = "" if preset[key] is None else str(preset[key]).strip()
+    calibration = [preset[key] for key in
+                   ("calibration_px1", "calibration_shift1", "calibration_px2", "calibration_shift2")]
+    if any(calibration):
+        if not all(calibration):
+            raise ValueError("Two-point calibration requires all four fields")
+        calibration_from_points(*calibration)
+    preset["show_gas_peaks"] = _to_bool(preset["show_gas_peaks"], "show_gas_peaks")
+    preset["show_auto_peaks"] = _to_bool(preset["show_auto_peaks"], "show_auto_peaks")
     return preset
 
 
@@ -156,8 +162,13 @@ def load_workflow_presets(path: str | Path | None = None) -> dict[str, dict[str,
         if raw is None:
             presets.pop(clean_name, None)
         elif isinstance(raw, dict):
-            presets[clean_name] = _coerce_preset(raw)
-    return {name: _coerce_preset(value) for name, value in presets.items()}
+            try:
+                presets[clean_name] = validate_workflow_preset(raw)
+            except ValueError as exc:
+                raise ValueError(f"Invalid preset {clean_name!r}: {exc}") from exc
+        else:
+            raise ValueError(f"Invalid preset {clean_name!r}: expected an object or deletion marker")
+    return {name: validate_workflow_preset(value) for name, value in presets.items()}
 
 
 def save_workflow_preset(
@@ -170,11 +181,9 @@ def save_workflow_preset(
         raise ValueError("Preset name cannot be empty")
 
     preset_path = Path(path) if path is not None else default_presets_path()
-    try:
-        presets = _load_stored_presets(preset_path)
-    except (OSError, ValueError, json.JSONDecodeError):
-        presets = {}
-    presets[clean_name] = _coerce_preset(preset)
+    validated = validate_workflow_preset(preset)
+    presets = _load_stored_presets(preset_path)
+    presets[clean_name] = validated
 
     preset_path.parent.mkdir(parents=True, exist_ok=True)
     preset_path.write_text(

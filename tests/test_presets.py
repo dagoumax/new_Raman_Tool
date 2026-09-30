@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from raman_tool.presets import delete_workflow_preset, load_workflow_presets, save_workflow_preset
 
@@ -57,15 +58,62 @@ def test_preset_preserves_mixed_case_gas_key(tmp_path):
     assert load_workflow_presets(path)["halon"]["concentration_gas"] == "CBrF₃"
 
 
-def test_invalid_preset_values_are_coerced(tmp_path):
+@pytest.mark.parametrize("settings", [
+    {"baseline_degree": "oops"}, {"baseline_degree": -1}, {"baseline_degree": 1.5},
+    {"baseline_degree": float("inf")}, {"col_merge": 0}, {"col_merge": 2.5},
+    {"baseline_lam": "nan"}, {"baseline_lam": 0}, {"baseline_lam": "inf"},
+    {"concentration_window": -1}, {"concentration_window": "inf"},
+    {"baseline_method": "unknown"}, {"concentration_strategy": "unknown"},
+    {"row_mode": "unknown"}, {"row_groups": "zero-10"},
+])
+def test_invalid_preset_values_are_rejected_without_silent_changes(tmp_path, settings):
     path = tmp_path / "presets.json"
-    path.write_text(json.dumps({"bad": {"baseline_degree": "oops", "col_merge": 0, "show_gas_peaks": "false"}}), encoding="utf-8")
+    path.write_text(json.dumps({"bad": settings}), encoding="utf-8")
+    original = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid preset 'bad'"):
+        load_workflow_presets(path)
+    with pytest.raises(ValueError):
+        save_workflow_preset("another", settings, path)
+    assert path.read_text(encoding="utf-8") == original
 
-    loaded = load_workflow_presets(path)
 
-    assert loaded["bad"]["baseline_degree"] == 3
-    assert loaded["bad"]["col_merge"] == 1
-    assert loaded["bad"]["show_gas_peaks"] is False
+@pytest.mark.parametrize("degree", [0, 8])
+def test_valid_core_parameters_are_preserved_without_clamping(tmp_path, degree):
+    path = tmp_path / "presets.json"
+    save_workflow_preset("valid", {
+        "baseline_degree": degree,
+        "baseline_lam": 0.125,
+        "concentration_window": 0.025,
+        "show_gas_peaks": "false",
+        "calibration_px1": 0, "calibration_shift1": 100,
+        "calibration_px2": 10, "calibration_shift2": 200,
+    }, path)
+    preset = load_workflow_presets(path)["valid"]
+    assert preset["baseline_degree"] == degree
+    assert preset["baseline_lam"] == 0.125
+    assert preset["concentration_window"] == 0.025
+    assert preset["calibration_px1"] == "0"
+    assert preset["show_gas_peaks"] is False
+
+
+@pytest.mark.parametrize("points", [
+    ("1", "100", "1", "200"), ("1", "100", "2", "100"),
+    ("nan", "100", "2", "200"), ("1", "100", "2", ""),
+    ("0", "-1e308", "1e-308", "1e308"),
+])
+def test_preset_calibration_uses_shared_finite_nonzero_rules(tmp_path, points):
+    keys = ("calibration_px1", "calibration_shift1", "calibration_px2", "calibration_shift2")
+    with pytest.raises(ValueError):
+        save_workflow_preset("bad calibration", dict(zip(keys, points)), tmp_path / "presets.json")
+
+
+def test_saving_does_not_replace_corrupted_storage(tmp_path):
+    path = tmp_path / "presets.json"
+    original = "{ damaged JSON"
+    path.write_text(original, encoding="utf-8")
+    with pytest.raises(ValueError):
+        save_workflow_preset("new", {}, path)
+    assert path.read_text(encoding="utf-8") == original
 
 
 

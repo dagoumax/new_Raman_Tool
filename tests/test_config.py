@@ -32,3 +32,13 @@ def test_save_and_load_config_roundtrip(tmp_path):
     assert loaded["safety"]["max_input_file_mb"] == 256
     assert loaded["safety"]["max_image_channels"] == 3
     assert loaded["safety"]["max_baseline_points"] == 50000
+
+
+def test_partial_safety_update_preserves_runtime_budgets(tmp_path):
+    path = tmp_path / "config.toml"
+    save_config({"runtime": {"max_history_states": 7, "max_cache_mb": 42}}, path)
+    save_config({"safety": {"max_text_file_mb": 32}}, path)
+    loaded = load_config(path)
+    assert loaded["runtime"]["max_history_states"] == 7
+    assert loaded["runtime"]["max_cache_mb"] == 42
+    assert loaded["safety"]["max_text_file_mb"] == 32
