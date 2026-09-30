@@ -6,7 +6,7 @@
     raman-tool batch <dir> [--baseline]
     raman-tool snr <file> [--peak X,Y] [--noise X,Y]
     raman-tool baseline <file> [--method arPLS] [--lam 1e5]
-    raman-tool concentration <file> <gas> [--ref N2]
+    raman-tool concentration <file> <gas>
     raman-tool info <file> [--row-groups X] [--col-merge N]
     raman-tool tui / qt
 """
@@ -24,6 +24,7 @@ from raman_tool.processing import (
 )
 from raman_tool.visualization import plot_spectrum, plot_baseline, plot_multiple, save_figure
 from raman_tool.exporters import unique_path
+from raman_tool.workflows import collect_spectrum_files, load_spectrum
 
 
 def _resolve_output_path(path: Path | str, overwrite: bool = False) -> Path:
@@ -34,15 +35,14 @@ def _resolve_output_path(path: Path | str, overwrite: bool = False) -> Path:
 
 
 def _load_spectrum(args: argparse.Namespace) -> Spectrum:
-    return read_file(
+    return load_spectrum(
         Path(args.file),
         row_groups=getattr(args, "row_groups", None),
         col_merge=getattr(args, "col_merge", 1),
+        calibration=getattr(args, "calibration", None),
+        row_mode=getattr(args, "row_mode", "mean"),
     )
 
-
-import matplotlib
-matplotlib.use("Agg")
 
 def cmd_plot(args: argparse.Namespace) -> int:
     filepath = Path(args.file)
@@ -52,9 +52,7 @@ def cmd_plot(args: argparse.Namespace) -> int:
 
     spectrum = _load_spectrum(args)
     if args.range:
-        parts = args.range.split(",")
-        if len(parts) == 2:
-            spectrum = spectrum.crop(float(parts[0]), float(parts[1]))
+        spectrum = spectrum.crop(*_parse_pair(args.range))
 
     fig = plot_spectrum(spectrum, show=not args.no_show)
     if args.output:
@@ -67,21 +65,13 @@ def cmd_plot(args: argparse.Namespace) -> int:
 
     return 0
 
-import matplotlib
-matplotlib.use("Agg")
-
 def cmd_batch(args: argparse.Namespace) -> int:
     directory = Path(args.directory)
     if not directory.is_dir():
         print(f"错误: 目录不存在 {directory}", file=sys.stderr)
         return 1
 
-    supported_exts = set(SUPPORTED_FORMATS.keys())
-    all_files = []
-    for ext in supported_exts:
-        all_files.extend(directory.glob(f"*{ext}"))
-        all_files.extend(directory.glob(f"*{ext.upper()}"))
-    all_files = natural_sorted(all_files)
+    all_files = collect_spectrum_files(directory)
 
     if not all_files:
         print(f"错误: 在{directory} 中未找到支持格式的文件", file=sys.stderr)
@@ -95,9 +85,11 @@ def cmd_batch(args: argparse.Namespace) -> int:
     ok, fail = 0, 0
     for filepath in all_files:
         try:
-            spectrum = read_file(filepath)
-            if args.baseline:
-                spectrum = subtract_baseline(spectrum, method="arPLS")
+            spectrum = load_spectrum(
+                filepath, row_groups=args.row_groups, col_merge=args.col_merge,
+                calibration=args.calibration, row_mode=args.row_mode,
+                baseline_options=_baseline_options(args) if args.baseline else None,
+            )
             fig = plot_spectrum(spectrum, show=False)
             out_path = _resolve_output_path(out_dir / f"{filepath.stem}.png", args.overwrite)
             save_figure(fig, out_path)
@@ -121,13 +113,9 @@ def cmd_snr(args: argparse.Namespace) -> int:
 
     peak_start = peak_end = noise_start = noise_end = None
     if args.peak:
-        parts = args.peak.split(",")
-        if len(parts) == 2:
-            peak_start, peak_end = float(parts[0]), float(parts[1])
+        peak_start, peak_end = _parse_pair(args.peak)
     if args.noise:
-        parts = args.noise.split(",")
-        if len(parts) == 2:
-            noise_start, noise_end = float(parts[0]), float(parts[1])
+        noise_start, noise_end = _parse_pair(args.noise)
 
     result = calculate_snr(spectrum, peak_start, peak_end, noise_start, noise_end)
 
@@ -135,14 +123,11 @@ def cmd_snr(args: argparse.Namespace) -> int:
     print(f"信噪比(SNR): {result['snr']:.2f}")
     print(f"信号强度:    {result['signal']:.2f}")
     print(f"噪声 RMS:     {result['noise_rms']:.4f}")
-    print(f"峰中心位置:  {result['peak_center']:.2f} cm-1")
+    print(f"峰中心位置:  {result['peak_center']:.2f} {spectrum.x_unit_label}")
     if result["peak_area"] > 0:
         print(f"峰面积:      {result['peak_area']:.4f}")
     return 0
 
-
-import matplotlib
-matplotlib.use("Agg")
 
 def cmd_baseline(args: argparse.Namespace) -> int:
     filepath = Path(args.file)
@@ -152,10 +137,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 
     spectrum = _load_spectrum(args)
 
-    method = args.method or "arPLS"
-    lam = args.lam or 1e5
-
-    corrected = subtract_baseline(spectrum, method=method, lam=lam, degree=3)
+    corrected = subtract_baseline(spectrum, **_baseline_options(args))
     baseline = spectrum.intensity - corrected.intensity
 
     fig = plot_baseline(spectrum, baseline=baseline, corrected=corrected, show=not args.no_show)
@@ -174,21 +156,24 @@ def cmd_concentration(args: argparse.Namespace) -> int:
     spectrum = _load_spectrum(args)
 
     try:
+        if args.baseline:
+            spectrum = subtract_baseline(spectrum, **_baseline_options(args))
         result = calculate_concentration(
             spectrum,
             gas_name=args.gas,
-            window=args.window or 10.0,
-            reference_gas=args.ref or "N2",
-            reference_concentration=args.ref_conc or 78.0,
+            window=args.window,
+            strategy=args.strategy,
         )
         print(f"文件: {filepath.name}")
         print(f"目标气体: {result['gas']}")
-        print(f"浓度:     {result['concentration']:.4f} %")
-        print(f"峰中心:   {result['peak_center']:.2f} cm-1")
+        print(f"归一化信号占比: {result['concentration']:.4f} %")
+        print(f"峰中心:   {result['peak_center']:.2f} {spectrum.x_unit_label}")
         print(f"峰面积:   {result['peak_area']:.4f}")
-        print(f"参考气体: {result['reference_gas']}")
-        print(f"参考峰:   {result['reference_peak_center']:.2f} cm-1")
-        print(f"参考面积: {result['reference_peak_area']:.4f}")
+        print("全部定量气体:")
+        for gas, percentage in result["all_concentrations"]["percentages"].items():
+            print(f"  {gas}: {percentage:.4f}%")
+        for warning in result["all_concentrations"].get("warnings", []):
+            print(f"说明: {warning}")
     except ValueError as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
@@ -207,7 +192,10 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"文件:        {filepath.name}")
     print(f"格式:        {filepath.suffix.upper()}")
     print(f"数据点数:    {spectrum.size}")
-    print(f"拉曼位移范围: {spectrum.raman_shift[0]:.2f} - {spectrum.raman_shift[-1]:.2f} cm-1")
+    print(
+        f"横轴范围:    {spectrum.raman_shift[0]:.2f} - "
+        f"{spectrum.raman_shift[-1]:.2f} {spectrum.x_unit_label}"
+    )
     print(f"强度范围:    {spectrum.intensity.min():.2f} - {spectrum.intensity.max():.2f}")
     print(f"强度均值:    {spectrum.intensity.mean():.2f}")
     print(f"强度标准差:  {spectrum.intensity.std():.2f}")
@@ -220,9 +208,51 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_pair(value: str) -> tuple[float, float]:
+    try:
+        parts = value.split(",")
+        if len(parts) != 2:
+            raise ValueError
+        return float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise ValueError("参数必须是逗号分隔的两个数字，如 100,200") from exc
+
+
+def cmd_validate_standard(args):
+    from raman_tool.reference_validation import validate_standard, write_validation_report
+    report = validate_standard(args.manifest)
+    for gas, comparison in report["comparisons"].items():
+        print(
+            f"{gas}: 参考={comparison['expected_percent']:.6f}% "
+            f"实算={comparison['actual_percent']:.6f}% "
+            f"偏差={comparison['error_percentage_points']:.6f} 个百分点 "
+            f"{'PASS' if comparison['passed'] else 'FAIL'}"
+        )
+    print(report["scope"])
+    if args.report:
+        write_validation_report(report, args.report, overwrite=args.overwrite)
+        print(f"验证报告: {args.report}")
+    return 0 if report["passed"] else 1
+
+
+def _baseline_options(args):
+    return {
+        "method": args.method, "lam": args.lam,
+        "degree": args.degree,
+    }
+
+
+def _add_baseline_args(parser):
+    parser.add_argument("-m", "--method", choices=["arPLS", "poly"], default="arPLS")
+    parser.add_argument("-d", "--degree", type=int, default=3)
+    parser.add_argument("--lam", type=float, default=1e5)
+
+
 def _add_tif_args(parser):
     parser.add_argument("--row-groups", help="TIF/BMP 行分组 如\"1-40, 91-130\"")
     parser.add_argument("--col-merge", type=int, default=1, help="TIF/BMP 列合并因子 (默认 1=不变)")
+    parser.add_argument("--row-mode", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--calibration", type=_parse_pair, help="像素线性校准 a,b：x = a*pixel+b")
 
 
 def main(args_list: list[str] | None = None) -> int:
@@ -238,7 +268,7 @@ def main(args_list: list[str] | None = None) -> int:
     p_plot = subparsers.add_parser("plot", help="绘制光谱")
     p_plot.add_argument("file", help="光谱文件路径")
     p_plot.add_argument("-o", "--output", help="输出图片路径")
-    p_plot.add_argument("-r", "--range", help="拉曼位移范围 (start,end)")
+    p_plot.add_argument("-r", "--range", help="横轴范围 (start,end)")
     p_plot.add_argument("--no-show", action="store_true", help="不显示图表")
     p_plot.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
     _add_tif_args(p_plot)
@@ -249,6 +279,8 @@ def main(args_list: list[str] | None = None) -> int:
     p_batch.add_argument("-o", "--output", help="输出目录 (默认: output/)")
     p_batch.add_argument("--baseline", action="store_true", help="执行基线校正 (arPLS)")
     p_batch.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
+    _add_tif_args(p_batch)
+    _add_baseline_args(p_batch)
 
     # snr
     p_snr = subparsers.add_parser("snr", help="计算信噪比")
@@ -260,9 +292,7 @@ def main(args_list: list[str] | None = None) -> int:
     # baseline
     p_bl = subparsers.add_parser("baseline", help="基线校正")
     p_bl.add_argument("file", help="光谱文件路径")
-    p_bl.add_argument("-m", "--method", choices=["arPLS", "poly"], default="arPLS", help="基线方法 (默认: arPLS)")
-    p_bl.add_argument("-d", "--degree", type=int, default=3, help="多项式阶数 (默认: 3)")
-    p_bl.add_argument("--lam", type=float, default=1e5, help="arPLS 平滑参数 (默认 1e5)")
+    _add_baseline_args(p_bl)
     p_bl.add_argument("-o", "--output", help="输出图片路径")
     p_bl.add_argument("--no-show", action="store_true", help="不显示图表")
     p_bl.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的输出文件")
@@ -271,10 +301,13 @@ def main(args_list: list[str] | None = None) -> int:
     # concentration
     p_conc = subparsers.add_parser("concentration", help="计算气体浓度")
     p_conc.add_argument("file", help="光谱文件路径")
-    p_conc.add_argument("gas", help="目标气体名称 (如 H2, CO2, CH4)")
-    p_conc.add_argument("-w", "--window", type=float, default=10.0, help="峰搜索窗口宽度")
-    p_conc.add_argument("--ref", default="N2", help="参考气体 (默认: N2)")
-    p_conc.add_argument("--ref-conc", type=float, default=78.0, help="参考气体浓度 (默认: 78%%)")
+    p_conc.add_argument("gas", help="气体库中已启用定量的目标气体")
+    p_conc.add_argument("-w", "--window", type=float, default=None, help="覆盖聚焦气体的半窗口 (cm⁻¹)")
+    p_conc.add_argument("--ref", default=None, help=argparse.SUPPRESS)
+    p_conc.add_argument("--ref-conc", type=float, default=None, help=argparse.SUPPRESS)
+    p_conc.add_argument("--strategy", choices=["peak_max", "peak_area"], default="peak_max")
+    p_conc.add_argument("--baseline", action="store_true", help="分析前执行基线校正")
+    _add_baseline_args(p_conc)
     _add_tif_args(p_conc)
 
     # info
@@ -285,6 +318,10 @@ def main(args_list: list[str] | None = None) -> int:
     # tui / qt
     subparsers.add_parser("tui", help="启动终端交互界面")
     subparsers.add_parser("qt", help="启动 Qt 桌面界面")
+    p_validate = subparsers.add_parser("validate-standard", help="与已知组成的标准样品/合成真值对照")
+    p_validate.add_argument("manifest", help="包含真值、容差、采集条件和气体库的 JSON 清单")
+    p_validate.add_argument("--report", help="输出 JSON 验证报告")
+    p_validate.add_argument("--overwrite", action="store_true")
 
     args = parser.parse_args(args_list)
 
@@ -295,6 +332,7 @@ def main(args_list: list[str] | None = None) -> int:
         "baseline": cmd_baseline,
         "concentration": cmd_concentration,
         "info": cmd_info,
+        "validate-standard": cmd_validate_standard,
     }
 
     if args.command == "tui":
@@ -306,7 +344,11 @@ def main(args_list: list[str] | None = None) -> int:
         return qt_main()
 
     if args.command in commands:
-        return commands[args.command](args)
+        try:
+            return commands[args.command](args)
+        except (ValueError, OSError, TypeError) as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 1
 
     parser.print_help()
     return 0
@@ -314,4 +356,3 @@ def main(args_list: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

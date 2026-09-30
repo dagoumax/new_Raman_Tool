@@ -10,6 +10,7 @@ Raman Tool is a local Raman spectroscopy data processing application. The projec
 - Supported input formats: `.txt`, `.asc`, `.sif`, `.tif`, `.tiff`, `.bmp`, `.jpg`, `.jpeg`.
 - Image import options for row groups, column merging, calibration, and mean/sum row mode.
 - Workflow presets for reusable baseline, concentration, batch, and display settings.
+- Repeatable baseline correction with an immutable raw-data snapshot, undo/redo, restore, and an append-only processing history.
 - Configurable gas Raman peak library for reference markers, automatic peak matching, and concentration windows.
 - Safety limits for very large files, oversized images, excessive data points, and expensive baseline correction.
 - Export protection: existing outputs are not overwritten by default; GUI exports ask for confirmation.
@@ -82,7 +83,7 @@ uv run raman-tool plot test_data\demo.txt --overwrite
 uv run raman-tool batch test_data --baseline -o output
 uv run raman-tool snr test_data\demo.txt --peak 2300,2350 --noise 3500,4000
 uv run raman-tool baseline test_data\demo.txt -m poly -d 3
-uv run raman-tool concentration test_data\demo.txt H2 --ref N2 --ref-conc 78.0
+uv run raman-tool concentration test_data\demo.txt O2
 uv run raman-tool info test_data\demo.txt
 uv run raman-tool tui
 uv run raman-tool qt
@@ -100,6 +101,16 @@ Output files are protected from accidental overwrite by default. Use `--overwrit
 | `.tif` / `.tiff` | TIFF image spectra |
 | `.bmp` | BMP image spectra |
 | `.jpg` / `.jpeg` | JPEG image spectra |
+
+## Coordinate Units
+
+The application distinguishes an uncalibrated pixel axis (`px`) from a Raman-shift axis (`cm⁻¹`) throughout loading, plotting, peak tables, status messages, and data export.
+
+- Exported TXT/ASC headers preserve units, calibration and history on reimport; legacy two-column files without a unit header are treated as Raman shift data.
+- SIF uses Raman shift only when a complete explicit calibration is available. Missing calibration stays in pixels; no coefficients or laser wavelength are guessed.
+- One-column TXT/ASC data and image spectra use pixels until a linear calibration is supplied.
+- Gas reference peaks and quantitative analysis are defined in `cm⁻¹`. They are disabled for pixel-axis spectra to prevent a pixel position from being mistaken for a Raman shift.
+- Exported TXT/ASC headers include the actual x-axis unit and record the linear calibration when one is present.
 
 ## Configuration
 
@@ -122,11 +133,17 @@ Workflow presets capture frequently changed processing settings:
 
 Built-in presets include `标准气体分析`, `峰面积定量`, and `快速查看`. User presets saved from the Qt GUI are written to `presets.json`.
 
+## Traceable Baseline Processing
+
+Each loaded spectrum keeps its original Raman shift and intensity arrays as a protected session snapshot. Manual baseline correction always operates on the current state, so correction can be applied repeatedly when required. Use `Ctrl+Z`, `Ctrl+Y`, or the controls in the baseline panel to undo, redo, or restore the original spectrum.
+
+Automatic loading correction, manual corrections, undo, redo, and restore operations are recorded in the processing history. Exporting the current spectrum embeds this history in a comment header. Use `File -> Export Original Spectrum Data...` to export the untouched session snapshot separately.
+
 ## Gas Peak Library
 
-The configurable gas peak library controls reference peak markers, automatic peak-to-gas matching, the default concentration windows, and batch quantitative outputs. Each gas entry contains a case-preserving key such as `CBrF₃`, display name, Raman peak center, half-window width, correction coefficient, color, enabled flag, and quantitative flag.
+The configurable gas peak library controls reference peak markers, automatic peak-to-gas matching, the default concentration windows, and single-file and batch quantitative outputs. Each gas entry contains a case-preserving key such as `CBrF₃`, display name, Raman peak center in `cm⁻¹`, half-window width in `cm⁻¹`, correction coefficient, color, enabled flag, and quantitative flag.
 
-`O2`, `N2`, and `CO2` are quantitative by default. Any additional gas marked as quantitative is included in batch concentration curves and TXT exports.
+`O2`, `N2`, and `CO2` are quantitative in the default library, but they are not hard-coded into the processing chain. Every enabled entry marked as quantitative appears dynamically in the Qt selector, single-file results, batch concentration curves, and TXT exports. Disabled or non-quantitative entries are excluded. If no quantitative gas is enabled, the application reports the configuration problem instead of silently falling back to a built-in list.
 
 ## Safety Limits
 
@@ -170,6 +187,46 @@ uv run pytest
 ```
 
 The current test suite covers core models, readers, processing, sorting, exporters, and safety limits.
+
+## Consistency and Reference Validation
+
+The desktop, CLI and terminal use common loading and validation functions.
+Finite one-dimensional data and strictly monotonic coordinates are required;
+ascending and descending axes are both supported. Column merging retains
+original detector-bin centers, including the final partial bin. Text export uses
+17 significant digits to preserve float64 values on reimport.
+
+Both peak height and area subtract the line joining window endpoints. Quantitative
+results are normalized weighted signals within the enabled gas set; default
+coefficients are all 1. They require independent response calibration before
+interpretation as physical composition. Missing windows, insufficient points,
+invalid settings and zero total signal produce explicit errors.
+
+Manual/automatic baseline operations run in background tasks. Loads ignore stale
+results; batch tasks capture their gas library and selected peak-window override.
+The same settings produce the same single/batch result. Cancellation takes effect
+between reads and numerical operations.
+
+History defaults to 32 snapshots / 128 MiB, preserving original data and a full
+audit stream. The interface displays the latest 200 audit records. The session
+cache retains 16 resident sessions / 256 MiB and spills others to private temporary
+disk storage (1 GiB). Configure budgets under [runtime] in config.toml.
+These resources last for the running application; export results before exit.
+
+~~~powershell
+uv run raman-tool concentration sample.asc CO2 --strategy peak_area --baseline --lam 100000
+uv run raman-tool info image.tif --col-merge 2 --calibration 2,100
+uv run raman-tool validate-standard tests/fixtures/standards/synthetic-mixture.json --report output/synthetic-report.json
+~~~
+
+The reference validator records source hashes, parameters, declared truth and
+deviations. The included 78:21:1 fixture is synthetic. Regression tests cover
+all four calculation entry points and queued Qt workers. CI configuration adds
+Windows/Linux, Python 3.10/3.12, minimum dependencies and package builds.
+Remote CI executes after pushing changes; local checks do not imply remote success.
+
+See [validation and release instructions](docs/VALIDATION.md) for measured samples,
+report interpretation, limits and release checks.
 
 ## GUI Policy
 
