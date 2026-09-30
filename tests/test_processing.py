@@ -3,6 +3,7 @@
 import pytest
 import numpy as np
 from raman_tool.models import Spectrum
+from raman_tool.gas_library import reload_gas_library
 from raman_tool.processing import (
     calculate_snr,
     find_peak,
@@ -11,6 +12,14 @@ from raman_tool.processing import (
     subtract_baseline,
     poly_baseline,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_gas_library(monkeypatch, tmp_path):
+    monkeypatch.setenv("RAMAN_TOOL_GAS_LIBRARY", str(tmp_path / "missing-gas-library.json"))
+    reload_gas_library()
+    yield
+    reload_gas_library()
 
 
 def create_gaussian_peak(center: float, height: float, sigma: float, noise: float = 0):
@@ -96,6 +105,16 @@ class TestBaseline:
 
 
 class TestConcentration:
+    def test_rejects_uncalibrated_pixel_axis(self):
+        spec = Spectrum(
+            np.arange(100, dtype=np.float64),
+            np.ones(100, dtype=np.float64),
+            metadata={"x_unit": "px"},
+        )
+
+        with pytest.raises(ValueError, match="校准"):
+            calculate_gas_concentrations(spec)
+
     def test_calculate_gas_concentrations_normalized(self):
         x = np.linspace(100, 4000, 4000)
         o2_peak = 200 * np.exp(-0.5 * ((x - 1555) / 5) ** 2)

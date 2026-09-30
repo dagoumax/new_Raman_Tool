@@ -1,6 +1,7 @@
 """文件读取器基类与格式检测."""
 
 from pathlib import Path
+from raman_tool.safety import check_file_size
 from raman_tool.models import Spectrum
 
 SUPPORTED_FORMATS = {
@@ -49,6 +50,7 @@ def read_file(
     from raman_tool.readers.bmp_reader import read_bmp
     from raman_tool.readers.jpg_reader import read_jpg
 
+    check_file_size(filepath)
     suffix = detect_format(filepath)
 
     if suffix in (".tif", ".tiff"):

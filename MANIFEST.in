@@ -1,0 +1,11 @@
+include README.md
+include uv.lock
+include launch_raman_tool.pyw
+include create_shortcut.ps1
+recursive-include tests *.py
+recursive-include tests/fixtures *.json *.txt
+recursive-include docs *.md
+recursive-include ci *.txt
+include validation/audit_local_samples.py
+include validation/compare_reference_strategies.py
+include validation/verify_distribution.py

@@ -1,8 +1,26 @@
 """光谱数据模型."""
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import numpy as np
+
+from raman_tool.validation import region_mask, validate_spectrum_arrays
+
+
+RAMAN_SHIFT_UNIT = "cm-1"
+PIXEL_UNIT = "px"
+
+
+def normalize_x_unit(value: str | None) -> str:
+    unit = str(RAMAN_SHIFT_UNIT if value is None else value).strip().lower()
+    if unit in {"px", "pixel", "pixels"}:
+        return PIXEL_UNIT
+    if unit in {"", "cm-1", "cm^-1", "cm⁻¹", "1/cm"}:
+        return RAMAN_SHIFT_UNIT
+    raise ValueError(f"Unsupported x-axis unit: {value!r}; supported units are cm-1 and px")
+
+
+def x_unit_label(unit: str | None) -> str:
+    return "px" if normalize_x_unit(unit) == PIXEL_UNIT else "cm⁻¹"
 
 
 @dataclass
@@ -29,28 +47,45 @@ class Spectrum:
     def shape(self) -> tuple:
         return self.raman_shift.shape
 
+    @property
+    def x_unit(self) -> str:
+        return normalize_x_unit(self.metadata.get("x_unit"))
+
+    @property
+    def x_unit_label(self) -> str:
+        return x_unit_label(self.x_unit)
+
+    @property
+    def x_label(self) -> str:
+        return "像素位置 (px)" if self.x_unit == PIXEL_UNIT else "拉曼位移 (cm⁻¹)"
+
+    @property
+    def x_plot_label(self) -> str:
+        """Matplotlib-safe x-axis label."""
+        return "像素位置 (px)" if self.x_unit == PIXEL_UNIT else r"拉曼位移 (cm$^{-1}$)"
+
+    @property
+    def is_raman_shift(self) -> bool:
+        return self.x_unit == RAMAN_SHIFT_UNIT
+
     def __post_init__(self):
-        if isinstance(self.raman_shift, list):
-            self.raman_shift = np.array(self.raman_shift, dtype=np.float64)
-        if isinstance(self.intensity, list):
-            self.intensity = np.array(self.intensity, dtype=np.float64)
-        if self.raman_shift.shape != self.intensity.shape:
-            raise ValueError(
-                f"raman_shift shape {self.raman_shift.shape} "
-                f"does not match intensity shape {self.intensity.shape}"
-            )
+        self.raman_shift, self.intensity = validate_spectrum_arrays(self.raman_shift, self.intensity)
+        if not isinstance(self.metadata, dict):
+            raise ValueError("metadata must be a dictionary")
+        self.metadata = self.metadata.copy()
+        self.metadata["x_unit"] = normalize_x_unit(self.metadata.get("x_unit"))
 
     def crop(self, start: float, end: float) -> "Spectrum":
-        """截取指定拉曼位移范围的光谱.
+        """截取指定横坐标范围的光谱.
 
         Args:
-            start: 起始拉曼位移 (cm-1)
-            end: 终止拉曼位移 (cm-1)
+            start: 起始横坐标
+            end: 终止横坐标
 
         Returns:
             截取后的新 Spectrum 对象
         """
-        mask = (self.raman_shift >= start) & (self.raman_shift <= end)
+        mask = region_mask(self.raman_shift, start, end, name="crop region")
         return Spectrum(
             raman_shift=self.raman_shift[mask].copy(),
             intensity=self.intensity[mask].copy(),

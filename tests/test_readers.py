@@ -73,6 +73,18 @@ class TestTXTReader:
         with pytest.raises(Exception):
             read_txt(filepath)
 
+    def test_one_column_data_uses_pixel_axis_until_calibrated(self, tmp_path):
+        filepath = tmp_path / "intensity_only.txt"
+        filepath.write_text("10\n20\n30\n", encoding="utf-8")
+
+        raw = read_txt(filepath)
+        calibrated = read_txt(filepath, calibration=(2.0, 100.0))
+
+        assert raw.x_unit == "px"
+        assert np.array_equal(raw.raman_shift, np.array([0.0, 1.0, 2.0]))
+        assert calibrated.x_unit == "cm-1"
+        assert np.array_equal(calibrated.raman_shift, np.array([100.0, 102.0, 104.0]))
+
 
 class TestASCReader:
     def test_read_basic(self, sample_asc_file):
@@ -100,6 +112,15 @@ class TestTifReader:
         spec = read_tif(filepath)
         assert spec.size == 50
         assert "image_shape" in spec.metadata
+        assert spec.x_unit == "px"
+
+    def test_calibrated_image_uses_raman_shift_axis(self, sample_tif):
+        filepath, arr = sample_tif
+        spec = read_tif(filepath, calibration=(2.0, 100.0))
+
+        assert spec.x_unit == "cm-1"
+        assert spec.raman_shift[0] == pytest.approx(100.0)
+        assert spec.raman_shift[-1] == pytest.approx(198.0)
 
     def test_read_with_row_groups(self, sample_tif):
         filepath, arr = sample_tif
@@ -201,11 +222,15 @@ class TestSIFReader:
         assert spec.intensity[1] == 9795.0
         assert spec.intensity[0] == 9539.0
 
-    def test_raman_shift_computed(self, sample_sif_file):
+    def test_missing_calibration_remains_pixels(self, sample_sif_file):
         from raman_tool.readers.sif_reader import read_sif
         spec = read_sif(sample_sif_file)
         assert len(spec.raman_shift) == 10
-        assert spec.raman_shift[0] > 0  # computed from calibration
+        assert spec.x_unit == "px"
+        assert np.array_equal(spec.raman_shift, np.arange(10))
+        assert spec.metadata["calibration_coefficients"] is None
+        assert spec.metadata["laser_wavelength"] is None
+        assert spec.metadata["calibration_warning"]
 
     def test_read_real_sif(self):
         """测试读取实际的 SIF 数据文件."""

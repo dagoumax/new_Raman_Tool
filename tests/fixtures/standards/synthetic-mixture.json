@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "sample_kind": "synthetic",
+  "sample_id": "triangular-mixture-78-21-1",
+  "reference_source": "Analytic synthetic fixture, not a measured/certified gas standard. Heights: N2=780, O2=105, CO2=20; response multipliers: 1, 2, 0.5. Corrected signals: 780, 210, 10.",
+  "acquisition_conditions": "Generated tabulated triangular peaks, half-width 80 cm^-1, constant background 10 counts. No instrument or laser was used.",
+  "file": "synthetic-mixture.txt",
+  "strategy": "peak_max",
+  "expected_percentages": {"N2": 78.0, "O2": 21.0, "CO2": 1.0},
+  "tolerance_percentage_points": 0.000001,
+  "gas_library": {
+    "N2": {"name": "氮气", "center": 2330, "half_width": 80, "coefficient": 1, "enabled": true, "quantitative": true},
+    "O2": {"name": "氧气", "center": 1555, "half_width": 80, "coefficient": 2, "enabled": true, "quantitative": true},
+    "CO2": {"name": "二氧化碳", "center": 1388, "half_width": 80, "coefficient": 0.5, "enabled": true, "quantitative": true}
+  }
+}

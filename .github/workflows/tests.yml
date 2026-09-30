@@ -1,0 +1,75 @@
+name: Tests and package verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.12"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Qt system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 xvfb xauth
+      - name: Install package and test dependencies
+        run: python -m pip install ".[qt,dev]" build
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Record resolved versions
+        run: python -m pip freeze > dependency-versions.txt
+      - name: Run regression and offscreen desktop tests on Windows
+        if: runner.os == 'Windows'
+        run: python -m pytest --junitxml=test-results.xml
+      - name: Run regression and offscreen desktop tests on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest --junitxml=test-results.xml
+      - name: Verify declared synthetic reference through CLI
+        run: python -m raman_tool validate-standard tests/fixtures/standards/synthetic-mixture.json --report synthetic-report.json
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Verify packaged CLI and source fixtures
+        run: python validation/verify_distribution.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            test-results.xml
+            synthetic-report.json
+            dependency-versions.txt
+            dist/*
+
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 xvfb xauth
+      - run: python -m pip install -c ci/minimum-dependencies.txt ".[qt,dev]"
+      - run: python -m pip check
+      - run: xvfb-run -a python -m pytest

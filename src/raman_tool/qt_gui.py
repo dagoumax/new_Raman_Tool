@@ -20,489 +20,34 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QGroupBox, QLabel, QLineEdit,
     QPushButton, QTextEdit, QFileDialog, QMessageBox, QStatusBar,
-    QMenuBar, QMenu, QTabWidget, QSplitter, QComboBox, QCheckBox,
+    QMenu, QTabWidget, QComboBox, QCheckBox,
     QProgressBar, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QDialog,
+    QDialog, QInputDialog,
 )
-from PySide6.QtCore import Qt, Signal, QThread, QMimeData
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
 
 from raman_tool.models import Spectrum
-from raman_tool.readers import read_file, detect_format, SUPPORTED_FORMATS
-from raman_tool.processing import calculate_snr, calculate_concentration, calculate_gas_concentrations, subtract_baseline
-from raman_tool.visualization import plot_spectrum, plot_baseline, save_figure, plot_multiple
+from raman_tool.history import SpectrumSession, SessionCache
+from raman_tool.readers import detect_format
+from raman_tool.sorting import natural_sorted
+from raman_tool.exporters import export_spectrum, normalize_export_path
+from raman_tool.processing import calculate_snr, calculate_concentration
+from raman_tool.visualization import plot_spectrum, save_figure
+from raman_tool.config import get_config, save_config
+from raman_tool.presets import delete_workflow_preset, load_workflow_presets, save_workflow_preset, validate_workflow_preset
+from raman_tool.safety import refresh_limits
+from raman_tool.validation import integer_parameter, positive_float, calibration_from_points
+from raman_tool.workflows import collect_spectrum_files
+from raman_tool.gas_library import (
+    default_gas_library_path, get_gas_library,
+    get_quantitative_gas_choices, reload_gas_library,
+    save_gas_library,
+)
 
 
-class ImageViewerWindow(QMainWindow):
-    """独立的 2D 灰度图显示窗口 (带十字光标)."""
-
-    def __init__(self, filepath: str, img_array: np.ndarray, parent=None):
-        super().__init__(parent)
-        self.filepath = str(filepath)
-        self._img_array = img_array
-        self._cursor_col: int | None = None
-        self._cursor_row: int | None = None
-        self._h_line = None
-        self._v_line = None
-
-        self.setWindowTitle(f"图像 - {Path(self.filepath).name}")
-        self.resize(900, 700)
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self._fig, self._ax = plt.subplots(figsize=(8, 6))
-        self._ax.imshow(self._img_array, cmap="gray", aspect="auto", origin="upper")
-        self._ax.set_title(Path(self.filepath).name)
-        self._ax.set_xlabel("列")
-        self._ax.set_ylabel("行")
-
-        self._canvas = FigureCanvas(self._fig)
-        self._toolbar = NavigationToolbar(self._canvas, self)
-        layout.addWidget(self._toolbar)
-        layout.addWidget(self._canvas)
-
-        self._canvas.mpl_connect("button_press_event", self._on_click)
-        self._canvas.mpl_connect("key_press_event", self._on_key)
-        self._canvas.setFocusPolicy(Qt.StrongFocus)
-
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("左键定位 | 方向键移动 | 右键/Esc 取消")
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._canvas.setFocus()
-
-    def _on_click(self, event):
-        from matplotlib.backend_bases import MouseButton
-        if event.inaxes != self._ax:
-            return
-        if self._toolbar.mode != "":
-            return
-        if event.button == MouseButton.RIGHT:
-            self._clear_cursor()
-            return
-        if event.button == MouseButton.LEFT:
-            x, y = event.xdata, event.ydata
-            if x is not None and y is not None:
-                self._cursor_col = int(round(x))
-                self._cursor_row = int(round(y))
-                self._update_cursor()
-
-    def _on_key(self, event):
-        if self._cursor_col is None:
-            return
-        h, w = self._img_array.shape
-        if event.key == "right":
-            self._cursor_col = min(w - 1, self._cursor_col + 1)
-        elif event.key == "left":
-            self._cursor_col = max(0, self._cursor_col - 1)
-        elif event.key == "up":
-            self._cursor_row = max(0, self._cursor_row - 1)
-        elif event.key == "down":
-            self._cursor_row = min(h - 1, self._cursor_row + 1)
-        elif event.key == "escape":
-            self._clear_cursor()
-            return
-        else:
-            return
-        self._update_cursor()
-
-    def _update_cursor(self):
-        # 创建或更新光标线 (复用对象，不反复 remove/redraw)
-        col, row = self._cursor_col, self._cursor_row
-        if self._h_line is None:
-            self._h_line = self._ax.axhline(row, color="red", linewidth=1.2, alpha=0.9, zorder=100)
-        else:
-            self._h_line.set_ydata([row, row])
-        if self._v_line is None:
-            self._v_line = self._ax.axvline(col, color="red", linewidth=1.2, alpha=0.9, zorder=100)
-        else:
-            self._v_line.set_xdata([col, col])
-
-        val = self._img_array[row, col]
-        self.status_bar.showMessage(
-            f"行={row}  列={col}  值={val:.1f}  |  方向键移动 | 右键/Esc 取消"
-        )
-        self._canvas.draw_idle()
-
-    def _clear_cursor(self):
-        self._cursor_col = None
-        self._cursor_row = None
-        if self._h_line:
-            self._h_line.set_visible(False)
-        if self._v_line:
-            self._v_line.set_visible(False)
-        self._canvas.draw_idle()
-        self.status_bar.showMessage("左键定位 | 方向键移动 | 右键/Esc 取消")
-
-
-class ConcentrationResultDialog(QDialog):
-    """Batch concentration curve dialog."""
-
-    def __init__(self, results: list[dict], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("批量浓度结果")
-        self.resize(980, 620)
-        self._results = results
-        self._cursor_index: int | None = None
-        self._cursor_v_line = None
-        self._cursor_markers = {}
-        self._stats = self._compute_fluctuation_stats(results)
-
-        layout = QVBoxLayout(self)
-        content_layout = QHBoxLayout()
-        layout.addLayout(content_layout)
-
-        chart_widget = QWidget()
-        chart_layout = QVBoxLayout(chart_widget)
-        content_layout.addWidget(chart_widget, stretch=1)
-
-        tool_box = QGroupBox("功能")
-        tool_layout = QVBoxLayout(tool_box)
-        tool_box.setMaximumWidth(220)
-        content_layout.addWidget(tool_box)
-
-        self._fig, self._ax = plt.subplots(figsize=(8, 5))
-        x = list(range(1, len(results) + 1))
-        self._gas_lines = {
-            "O2": self._ax.plot(x, [r["O2"] for r in results], marker="o", linewidth=1.2, label="O2")[0],
-            "N2": self._ax.plot(x, [r["N2"] for r in results], marker="o", linewidth=1.2, label="N2")[0],
-            "CO2": self._ax.plot(x, [r["CO2"] for r in results], marker="o", linewidth=1.2, label="CO2")[0],
-        }
-        self._ax.set_xlabel("文件序号")
-        self._ax.set_ylabel("浓度 (%)")
-        self._ax.set_title("O2 / N2 / CO2 浓度曲线")
-        self._ax.grid(True, alpha=0.3)
-        self._ax.legend(loc="best")
-        self._fig.tight_layout()
-
-        self._canvas = FigureCanvas(self._fig)
-        toolbar = NavigationToolbar(self._canvas, self)
-        chart_layout.addWidget(toolbar)
-        chart_layout.addWidget(self._canvas)
-        self._canvas.mpl_connect("button_press_event", self._on_chart_click)
-        self._canvas.mpl_connect("key_press_event", self._on_key_press)
-        self._canvas.setFocusPolicy(Qt.StrongFocus)
-
-        summary = QLabel(
-            f"共 {len(results)} 个结果 | "
-            f"O2: {np.mean([r['O2'] for r in results]):.4f}% | "
-            f"N2: {np.mean([r['N2'] for r in results]):.4f}% | "
-            f"CO2: {np.mean([r['CO2'] for r in results]):.4f}%"
-        )
-        chart_layout.addWidget(summary)
-
-        tool_layout.addWidget(QLabel("显示气体:"))
-        self._gas_checks = {}
-        for gas in ("O2", "N2", "CO2"):
-            cb = QCheckBox(gas)
-            cb.setChecked(True)
-            cb.toggled.connect(self._update_visible_gases)
-            tool_layout.addWidget(cb)
-            self._gas_checks[gas] = cb
-
-        tool_layout.addWidget(QLabel(""))
-        tool_layout.addWidget(QLabel("波动分析:"))
-        self._stats_label = QLabel(self._format_stats_text())
-        self._stats_label.setWordWrap(True)
-        tool_layout.addWidget(self._stats_label)
-
-        tool_layout.addWidget(QLabel(""))
-        tool_layout.addWidget(QLabel("光标读数:"))
-        self._cursor_status = QLabel("左键定位曲线\n方向键移动\n右键/Esc 取消")
-        self._cursor_status.setWordWrap(True)
-        tool_layout.addWidget(self._cursor_status)
-
-        tool_layout.addWidget(QLabel(""))
-        self._export_cb = QCheckBox("导出 TXT")
-        self._export_cb.toggled.connect(self._on_export_toggled)
-        tool_layout.addWidget(self._export_cb)
-
-        self._save_btn = QPushButton("选择位置并保存")
-        self._save_btn.setEnabled(False)
-        self._save_btn.clicked.connect(self._save_results_txt)
-        tool_layout.addWidget(self._save_btn)
-
-        self._save_status = QLabel("")
-        self._save_status.setWordWrap(True)
-        tool_layout.addWidget(self._save_status)
-        tool_layout.addStretch()
-        self._canvas.setFocus()
-
-    @staticmethod
-    def _compute_fluctuation_stats(results: list[dict]) -> dict:
-        stats = {}
-        for gas in ("O2", "N2", "CO2"):
-            vals = np.array([float(row[gas]) for row in results], dtype=np.float64)
-            if vals.size == 0:
-                stats[gas] = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "range": 0.0, "cv": 0.0}
-                continue
-            mean = float(np.mean(vals))
-            std = float(np.std(vals, ddof=1)) if vals.size >= 2 else 0.0
-            min_val = float(np.min(vals))
-            max_val = float(np.max(vals))
-            stats[gas] = {
-                "mean": mean,
-                "std": std,
-                "min": min_val,
-                "max": max_val,
-                "range": max_val - min_val,
-                "cv": std / mean if abs(mean) > 1e-12 else 0.0,
-            }
-        return stats
-
-    def _format_stats_text(self) -> str:
-        lines = []
-        for gas in ("O2", "N2", "CO2"):
-            s = self._stats[gas]
-            lines.append(
-                f"{gas}: std={s['std']:.4f}%\n"
-                f"  min={s['min']:.4f}% max={s['max']:.4f}%\n"
-                f"  range={s['range']:.4f}% CV={s['cv']:.4f}"
-            )
-        return "\n".join(lines)
-
-    def _update_visible_gases(self, *_args):
-        any_visible = False
-        for gas, line in self._gas_lines.items():
-            visible = self._gas_checks[gas].isChecked()
-            line.set_visible(visible)
-            marker = self._cursor_markers.get(gas)
-            if marker is not None:
-                marker.set_visible(visible and self._cursor_index is not None)
-            any_visible = any_visible or visible
-
-        if any_visible:
-            self._ax.legend(
-                [line for line in self._gas_lines.values() if line.get_visible()],
-                [gas for gas, line in self._gas_lines.items() if line.get_visible()],
-                loc="best",
-            )
-        legend = self._ax.get_legend()
-        if legend is not None:
-            legend.set_visible(any_visible)
-        self._ax.relim(visible_only=True)
-        self._ax.autoscale_view()
-        self._update_cursor_status()
-        self._canvas.draw_idle()
-
-    def _on_chart_click(self, event):
-        from matplotlib.backend_bases import MouseButton
-        if event.inaxes != self._ax:
-            return
-        if event.button == MouseButton.RIGHT:
-            self._clear_cursor()
-            return
-        if event.button != MouseButton.LEFT or event.xdata is None or not self._results:
-            return
-        idx = int(round(event.xdata)) - 1
-        idx = max(0, min(len(self._results) - 1, idx))
-        self._set_cursor_index(idx)
-
-    def _on_key_press(self, event):
-        if self._cursor_index is None:
-            return
-        if event.key == "right":
-            self._set_cursor_index(min(len(self._results) - 1, self._cursor_index + 1))
-        elif event.key == "left":
-            self._set_cursor_index(max(0, self._cursor_index - 1))
-        elif event.key == "escape":
-            self._clear_cursor()
-
-    def _set_cursor_index(self, idx: int):
-        self._cursor_index = idx
-        x = idx + 1
-        row = self._results[idx]
-        if self._cursor_v_line is None:
-            self._cursor_v_line = self._ax.axvline(x, color="red", linewidth=1, linestyle="--", alpha=0.75, zorder=20)
-        else:
-            self._cursor_v_line.set_xdata([x, x])
-            self._cursor_v_line.set_visible(True)
-
-        for gas in ("O2", "N2", "CO2"):
-            y = row[gas]
-            marker = self._cursor_markers.get(gas)
-            if marker is None:
-                marker = self._ax.plot([x], [y], "o", color="red", markersize=5, zorder=25)[0]
-                self._cursor_markers[gas] = marker
-            else:
-                marker.set_data([x], [y])
-            marker.set_visible(self._gas_checks[gas].isChecked())
-
-        self._update_cursor_status()
-        self._canvas.setFocus()
-        self._canvas.draw_idle()
-
-    def _update_cursor_status(self):
-        if self._cursor_index is None:
-            self._cursor_status.setText("左键定位曲线\n方向键移动\n右键/Esc 取消")
-            return
-        row = self._results[self._cursor_index]
-        lines = [f"序号: {row['index']}", f"文件: {row['filename']}"]
-        for gas in ("O2", "N2", "CO2"):
-            if self._gas_checks[gas].isChecked():
-                lines.append(f"{gas}: {row[gas]:.4f}%")
-        self._cursor_status.setText("\n".join(lines))
-
-    def _clear_cursor(self):
-        self._cursor_index = None
-        if self._cursor_v_line is not None:
-            self._cursor_v_line.set_visible(False)
-        for marker in self._cursor_markers.values():
-            marker.set_visible(False)
-        self._update_cursor_status()
-        self._canvas.draw_idle()
-
-    def _on_export_toggled(self, checked: bool):
-        self._save_btn.setEnabled(checked)
-        if not checked:
-            self._save_status.setText("")
-
-    def _save_results_txt(self):
-        filepath, _ = QFileDialog.getSaveFileName(
-            self,
-            "保存浓度结果",
-            "concentration_results.txt",
-            "TXT 文件 (*.txt);;所有文件 (*.*)",
-        )
-        if not filepath:
-            return
-        path = Path(filepath)
-        if path.suffix.lower() != ".txt":
-            path = path.with_suffix(".txt")
-
-        header = "\t".join(["index", "filename", "O2_percent", "N2_percent", "CO2_percent", "O2_I", "N2_I", "CO2_I"])
-        lines = [header]
-        for row in self._results:
-            lines.append("\t".join([
-                str(row["index"]),
-                row["filename"],
-                f"{row['O2']:.6f}",
-                f"{row['N2']:.6f}",
-                f"{row['CO2']:.6f}",
-                f"{row['O2_I']:.6f}",
-                f"{row['N2_I']:.6f}",
-                f"{row['CO2_I']:.6f}",
-            ]))
-        lines.append("")
-        lines.append("fluctuation_analysis")
-        lines.append("\t".join(["gas", "mean_percent", "std_percent", "min_percent", "max_percent", "range_percent", "cv"]))
-        for gas in ("O2", "N2", "CO2"):
-            s = self._stats[gas]
-            lines.append("\t".join([
-                gas,
-                f"{s['mean']:.6f}",
-                f"{s['std']:.6f}",
-                f"{s['min']:.6f}",
-                f"{s['max']:.6f}",
-                f"{s['range']:.6f}",
-                f"{s['cv']:.6f}",
-            ]))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        self._save_status.setText(f"已保存:\n{path}")
-
-
-class SpectrumLoadThread(QThread):
-    """后台加载光谱文件的线程."""
-    finished_loading = Signal(object, str, str)  # spectrum, filepath, cache_key
-    error_occurred = Signal(str)
-
-    def __init__(
-        self,
-        filepath: str,
-        row_groups: str | None = None,
-        col_merge: int = 1,
-        calibration: tuple | None = None,
-        row_mode: str = "mean",
-        cache_key: str | None = None,
-    ):
-        super().__init__()
-        self.filepath = filepath
-        self.row_groups = row_groups
-        self.col_merge = col_merge
-        self.calibration = calibration
-        self.row_mode = row_mode
-        self.cache_key = cache_key or filepath
-
-    def run(self):
-        try:
-            spectrum = read_file(
-                Path(self.filepath),
-                row_groups=self.row_groups,
-                col_merge=self.col_merge,
-                calibration=self.calibration,
-                row_mode=self.row_mode,
-            )
-            self.finished_loading.emit(spectrum, self.filepath, self.cache_key)
-        except Exception as e:
-            self.error_occurred.emit(str(e))
-
-
-class BatchProcessThread(QThread):
-    """后台批处理线程."""
-    progress_update = Signal(int, int)
-    file_done = Signal(str, bool)
-    all_done = Signal(int, int, object)
-
-    def __init__(
-        self,
-        files,
-        do_baseline,
-        row_groups: str | None = None,
-        col_merge: int = 1,
-        calibration: tuple | None = None,
-        row_mode: str = "mean",
-        strategy: str = "peak_max",
-    ):
-        super().__init__()
-        self.files = files
-        self.do_baseline = do_baseline
-        self.row_groups = row_groups
-        self.col_merge = col_merge
-        self.calibration = calibration
-        self.row_mode = row_mode
-        self.strategy = strategy
-
-    def run(self):
-        ok = 0
-        fail = 0
-        total = len(self.files)
-        results = []
-        for i, f in enumerate(self.files):
-            try:
-                spectrum = read_file(
-                    f,
-                    row_groups=self.row_groups,
-                    col_merge=self.col_merge,
-                    calibration=self.calibration,
-                    row_mode=self.row_mode,
-                )
-                if self.do_baseline:
-                    spectrum = subtract_baseline(spectrum, method="arPLS")
-                conc = calculate_gas_concentrations(spectrum, strategy=self.strategy)
-                percentages = conc["percentages"]
-                peaks = conc["peaks"]
-                results.append({
-                    "index": ok + 1,
-                    "filename": f.name,
-                    "O2": percentages.get("O2", 0.0),
-                    "N2": percentages.get("N2", 0.0),
-                    "CO2": percentages.get("CO2", 0.0),
-                    "O2_I": peaks.get("O2", {}).get("intensity", 0.0),
-                    "N2_I": peaks.get("N2", {}).get("intensity", 0.0),
-                    "CO2_I": peaks.get("CO2", {}).get("intensity", 0.0),
-                })
-                ok += 1
-                self.file_done.emit(f.name, True)
-            except Exception:
-                fail += 1
-                self.file_done.emit(f.name, False)
-            self.progress_update.emit(i + 1, total)
-        self.all_done.emit(ok, fail, results)
+from raman_tool.qt_dialogs import GasLibraryDialog, SafetySettingsDialog, ImageViewerWindow, ConcentrationResultDialog
+from raman_tool.qt_workers import SpectrumLoadThread, BaselineThread, BatchProcessThread, BatchExportThread, WorkerManager
 
 
 class RamanQtGUI(QMainWindow):
@@ -513,7 +58,17 @@ class RamanQtGUI(QMainWindow):
 
         self.current_spectrum: Spectrum | None = None
         self.current_file: str = ""
-        self.loaded_spectra: dict[str, Spectrum] = {}
+        self.spectrum_sessions = SessionCache()
+        self._workers = WorkerManager(self)
+        self._workers.worker_finished.connect(self._on_worker_finished)
+        self._workers.idle.connect(self._on_workers_idle)
+        self._closing = False
+        self._load_request = 0
+        self._baseline_worker = None
+        self._batch_worker = None
+        self.last_batch_failures: list[dict[str, str]] = []
+        self.current_session: SpectrumSession | None = None
+        self.current_cache_key: str = ""
         self.current_figure: plt.Figure | None = None
         self.canvas: FigureCanvas | None = None
         self._toolbar_ref = None
@@ -546,6 +101,47 @@ class RamanQtGUI(QMainWindow):
 
         self._apply_style()
 
+    def _on_worker_finished(self, worker):
+        if worker is self._baseline_worker:
+            self._baseline_worker = None
+            self.baseline_apply_btn.setEnabled(True)
+        if worker is self._batch_worker:
+            self._batch_worker = None
+            self.batch_start_btn.setEnabled(True)
+            self.batch_cancel_btn.setEnabled(False)
+        self._update_history_ui()
+
+    def _on_workers_idle(self):
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        self._closing = True
+        if self._workers.workers:
+            self._load_request += 1
+            self._workers.interrupt_all()
+            self.setEnabled(False)
+            self.status_bar.showMessage("正在等待当前计算安全结束...")
+            event.ignore()
+            return
+        self._clear_canvas()
+        for viewer in self.findChildren(ImageViewerWindow) + self.findChildren(ConcentrationResultDialog):
+            viewer.close()
+        self.spectrum_sessions.close()
+        event.accept()
+
+    def _invalidate_loads(self):
+        self._load_request += 1
+        for worker in tuple(self._workers.workers):
+            if isinstance(worker, SpectrumLoadThread):
+                worker.requestInterruption()
+
+    def _on_cancel_batch(self):
+        if self._batch_worker is not None:
+            self._batch_worker.requestInterruption()
+            self.batch_cancel_btn.setEnabled(False)
+            self.batch_status.setText("正在取消，等待当前文件处理结束...")
+
     def _setup_menus(self):
         menubar = self.menuBar()
 
@@ -568,6 +164,19 @@ class RamanQtGUI(QMainWindow):
         export_action.triggered.connect(self._on_export_chart)
         file_menu.addAction(export_action)
 
+        export_spectrum_action = QAction("导出当前光谱数据(&S)...", self)
+        export_spectrum_action.setShortcut("Ctrl+Shift+E")
+        export_spectrum_action.triggered.connect(self._on_export_spectrum)
+        file_menu.addAction(export_spectrum_action)
+
+        export_raw_action = QAction("导出原始光谱数据...", self)
+        export_raw_action.triggered.connect(self._on_export_raw_spectrum)
+        file_menu.addAction(export_raw_action)
+
+        export_all_spectra_action = QAction("导出全部光谱数据(&A)...", self)
+        export_all_spectra_action.triggered.connect(self._on_export_all_spectra)
+        file_menu.addAction(export_all_spectra_action)
+
         file_menu.addSeparator()
 
         quit_action = QAction("退出(&Q)", self)
@@ -585,6 +194,23 @@ class RamanQtGUI(QMainWindow):
         baseline_action.triggered.connect(self._on_baseline)
         process_menu.addAction(baseline_action)
 
+        self.undo_processing_action = QAction("撤销处理", self)
+        self.undo_processing_action.setShortcut("Ctrl+Z")
+        self.undo_processing_action.setEnabled(False)
+        self.undo_processing_action.triggered.connect(self._on_undo_processing)
+        process_menu.addAction(self.undo_processing_action)
+
+        self.redo_processing_action = QAction("重做处理", self)
+        self.redo_processing_action.setShortcut("Ctrl+Y")
+        self.redo_processing_action.setEnabled(False)
+        self.redo_processing_action.triggered.connect(self._on_redo_processing)
+        process_menu.addAction(self.redo_processing_action)
+
+        self.restore_raw_action = QAction("恢复原始光谱", self)
+        self.restore_raw_action.setEnabled(False)
+        self.restore_raw_action.triggered.connect(self._on_restore_raw)
+        process_menu.addAction(self.restore_raw_action)
+
         conc_action = QAction("气体浓度分析(&C)...", self)
         conc_action.triggered.connect(self._on_concentration)
         process_menu.addAction(conc_action)
@@ -594,6 +220,19 @@ class RamanQtGUI(QMainWindow):
         batch_action = QAction("批量处理(&T)...", self)
         batch_action.triggered.connect(self._on_batch)
         process_menu.addAction(batch_action)
+
+        presets_menu = menubar.addMenu("预设(&R)")
+        apply_preset_action = QAction("应用工作流预设...", self)
+        apply_preset_action.triggered.connect(self._on_apply_workflow_preset)
+        presets_menu.addAction(apply_preset_action)
+
+        save_preset_action = QAction("保存当前为预设...", self)
+        save_preset_action.triggered.connect(self._on_save_workflow_preset)
+        presets_menu.addAction(save_preset_action)
+
+        delete_preset_action = QAction("删除工作流预设...", self)
+        delete_preset_action.triggered.connect(self._on_delete_workflow_preset)
+        presets_menu.addAction(delete_preset_action)
 
         settings_menu = menubar.addMenu("设置(&S)")
 
@@ -621,10 +260,223 @@ class RamanQtGUI(QMainWindow):
         )
         settings_menu.addAction(self.show_log_panel_action)
 
+        settings_menu.addSeparator()
+        gas_library_action = QAction("气体峰位库...", self)
+        gas_library_action.triggered.connect(self._on_gas_library_settings)
+        settings_menu.addAction(gas_library_action)
+
+        safety_action = QAction("安全限制...", self)
+        safety_action.triggered.connect(self._on_safety_settings)
+        settings_menu.addAction(safety_action)
+
         help_menu = menubar.addMenu("帮助(&H)")
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
+
+    def _get_baseline_options(self) -> dict:
+        if self.baseline_method.currentIndex() == 0:
+            lam_text = self.baseline_lam.text().strip()
+            lam = positive_float(lam_text if lam_text else 1e5, "lam")
+            return {"method": "arPLS", "lam": lam}
+        return {"method": "poly", "degree": int(self.baseline_degree.currentText())}
+
+    def _format_baseline_options(self, options: dict) -> str:
+        if options.get("method") == "poly":
+            return f"poly, degree={int(options.get('degree', 3))}"
+        return f"arPLS, lam={float(options.get('lam', 1e5)):.1e}"
+
+    def _collect_workflow_preset(self) -> dict:
+        method = "arPLS" if self.baseline_method.currentIndex() == 0 else "poly"
+        strategy = "peak_area" if self.conc_strategy.currentIndex() == 1 else "peak_max"
+        row_mode = "sum" if self.row_mode_combo.currentIndex() == 1 else "mean"
+        gas_name = str(self.conc_gas.currentData() or "")
+        lam = positive_float(self.baseline_lam.text().strip() or "100000", "lam")
+        window = positive_float(self.conc_window.text().strip() or "10", "聚焦气体窗口")
+        col_merge = integer_parameter(self.img_col_merge.text().strip() or "1", "列合并", minimum=1)
+
+        calibration_values = [
+            self.cal_px1.text().strip(),
+            self.cal_rs1.text().strip(),
+            self.cal_px2.text().strip(),
+            self.cal_rs2.text().strip(),
+        ]
+        self._get_calibration()
+        return {
+            "baseline_method": method,
+            "baseline_lam": lam,
+            "baseline_degree": int(self.baseline_degree.currentText()),
+            "auto_baseline": self.auto_baseline_cb.isChecked(),
+            "batch_baseline": self.batch_baseline_cb.isChecked(),
+            "concentration_gas": gas_name,
+            "concentration_window": window,
+            "concentration_strategy": strategy,
+            "row_mode": row_mode,
+            "col_merge": col_merge,
+            "row_groups": self.img_row_groups.text().strip(),
+            "show_individual_rows": self.img_show_rows_cb.isChecked(),
+            "calibration_px1": calibration_values[0],
+            "calibration_shift1": calibration_values[1],
+            "calibration_px2": calibration_values[2],
+            "calibration_shift2": calibration_values[3],
+            "show_gas_peaks": self.gas_peaks_cb.isChecked(),
+            "show_auto_peaks": self.auto_peaks_cb.isChecked(),
+        }
+
+    def _apply_workflow_preset(self, preset: dict):
+        preset = validate_workflow_preset(preset)
+        self._invalidate_loads()
+        self.baseline_method.setCurrentIndex(1 if preset.get("baseline_method") == "poly" else 0)
+        self.baseline_lam.setText(str(preset.get("baseline_lam", 100000.0)))
+        degree = str(int(preset.get("baseline_degree", 3)))
+        idx = self.baseline_degree.findText(degree)
+        if idx < 0:
+            self.baseline_degree.addItem(degree)
+        self.baseline_degree.setCurrentText(degree)
+        self.auto_baseline_cb.setChecked(bool(preset.get("auto_baseline", True)))
+        self.batch_baseline_cb.setChecked(bool(preset.get("batch_baseline", True)))
+
+        gas = str(preset.get("concentration_gas") or "").casefold()
+        for i in range(self.conc_gas.count()):
+            if str(self.conc_gas.itemData(i) or "").casefold() == gas:
+                self.conc_gas.setCurrentIndex(i)
+                break
+        self.conc_window.setText(str(preset.get("concentration_window", 10.0)))
+        self.conc_strategy.setCurrentIndex(1 if preset.get("concentration_strategy") == "peak_area" else 0)
+
+        self.row_mode_combo.setCurrentIndex(1 if preset.get("row_mode") == "sum" else 0)
+        self.img_col_merge.setText(str(preset["col_merge"]))
+        self.img_row_groups.setText(str(preset.get("row_groups", "")))
+        self.img_show_rows_cb.setChecked(bool(preset.get("show_individual_rows", False)))
+        self.cal_px1.setText(str(preset.get("calibration_px1", "")))
+        self.cal_rs1.setText(str(preset.get("calibration_shift1", "")))
+        self.cal_px2.setText(str(preset.get("calibration_px2", "")))
+        self.cal_rs2.setText(str(preset.get("calibration_shift2", "")))
+        self.gas_peaks_cb.setChecked(bool(preset.get("show_gas_peaks", True)))
+        self.auto_peaks_cb.setChecked(bool(preset.get("show_auto_peaks", True)))
+        # Cache keys already separate import/calibration/baseline settings.
+        # Applying a preset must not discard edits to other loaded files.
+        self.current_session = None
+        self.current_cache_key = ""
+        if self.current_file:
+            self._load_file(self.current_file)
+        elif self.current_spectrum is not None:
+            if self._show_auto_peaks:
+                self._detect_peaks()
+            else:
+                self._detected_peaks = []
+                self.peak_table.setRowCount(0)
+            self._update_plot()
+
+    def _on_apply_workflow_preset(self):
+        try:
+            presets = load_workflow_presets()
+        except Exception as e:
+            QMessageBox.critical(self, "预设读取失败", str(e))
+            return
+        names = list(presets.keys())
+        if not names:
+            QMessageBox.information(self, "预设", "没有可用的工作流预设")
+            return
+        name, ok = QInputDialog.getItem(self, "应用工作流预设", "选择预设:", names, 0, False)
+        if not ok or not name:
+            return
+        self._apply_workflow_preset(presets[name])
+        self._log(f"已应用工作流预设: {name}")
+        self.status_bar.showMessage(f"已应用工作流预设: {name}")
+
+    def _on_save_workflow_preset(self):
+        name, ok = QInputDialog.getText(self, "保存工作流预设", "预设名称:")
+        if not ok or not name.strip():
+            return
+        try:
+            path = save_workflow_preset(name, self._collect_workflow_preset())
+        except Exception as e:
+            QMessageBox.critical(self, "预设保存失败", str(e))
+            return
+        self._log(f"工作流预设已保存: {name.strip()} -> {path}")
+        QMessageBox.information(self, "预设已保存", f"工作流预设已保存。\n{path}")
+
+    def _on_delete_workflow_preset(self):
+        try:
+            presets = load_workflow_presets()
+        except Exception as e:
+            QMessageBox.critical(self, "预设读取失败", str(e))
+            return
+        names = list(presets.keys())
+        if not names:
+            QMessageBox.information(self, "预设", "没有可删除的工作流预设")
+            return
+        name, ok = QInputDialog.getItem(self, "删除工作流预设", "选择预设:", names, 0, False)
+        if not ok or not name:
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除预设吗？\n{name}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            path = delete_workflow_preset(name)
+        except Exception as e:
+            QMessageBox.critical(self, "预设删除失败", str(e))
+            return
+        self._log(f"工作流预设已删除: {name} -> {path}")
+        QMessageBox.information(self, "预设已删除", f"工作流预设已删除。\n{path}")
+
+    def _on_gas_library_settings(self):
+        dialog = GasLibraryDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            path = save_gas_library(dialog.to_library())
+            reload_gas_library()
+        except Exception as e:
+            QMessageBox.critical(self, "气体峰位库保存失败", str(e))
+            return
+        self._refresh_concentration_gases()
+        self._update_axis_dependent_ui()
+        if self.current_spectrum is not None:
+            if self._show_auto_peaks:
+                self._detect_peaks()
+            self._update_plot()
+        self._log(f"气体峰位库已保存: {path}")
+        QMessageBox.information(self, "峰位库已保存", f"气体峰位库已更新。\n{path}")
+
+    def _refresh_concentration_gases(self):
+        current = self.conc_gas.currentData() if hasattr(self, "conc_gas") else None
+        self.conc_gas.clear()
+        choices = get_quantitative_gas_choices()
+        for key, label in choices:
+            self.conc_gas.addItem(label, key)
+        if not choices:
+            self.conc_gas.addItem("气体库中没有启用定量的气体", None)
+        for i, (key, _label) in enumerate(choices):
+            if key.casefold() == str(current or "").casefold():
+                self.conc_gas.setCurrentIndex(i)
+                break
+        if hasattr(self, "conc_window"):
+            self._on_concentration_gas_changed()
+
+    def _on_concentration_gas_changed(self, _index: int | None = None):
+        if not hasattr(self, "conc_window"):
+            return
+        gas_key = self.conc_gas.currentData()
+        gas_info = get_gas_library().get(str(gas_key)) if gas_key else None
+        if gas_info:
+            self.conc_window.setText(f"{float(gas_info['half_width']):g}")
+
+    def _on_safety_settings(self):
+        dialog = SafetySettingsDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        path = save_config(dialog.to_config())
+        refresh_limits()
+        self._log(f"安全限制设置已保存: {path}")
+        QMessageBox.information(self, "设置已保存", f"安全限制已更新。\n{path}")
 
     def _setup_central(self):
         """设置中央绘图区域."""
@@ -668,9 +520,10 @@ class RamanQtGUI(QMainWindow):
         if self.current_figure is None or self.canvas is None:
             return
         try:
-            self.current_figure.tight_layout()
+            self.current_figure.tight_layout(rect=(0.02, 0.02, 0.98, 0.98))
         except Exception:
             pass
+        self.current_figure.subplots_adjust(left=0.14, right=0.98, bottom=0.12, top=0.92)
         self.canvas.draw_idle()
 
     def _setup_docks(self):
@@ -678,7 +531,9 @@ class RamanQtGUI(QMainWindow):
         # 左侧: 文件列表
         left_dock = QDockWidget("文件列表", self)
         left_dock.setFeatures(
-            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+            QDockWidget.DockWidgetClosable
+            | QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
         )
         self.file_list_dock = left_dock
         left_dock.setMinimumWidth(220)
@@ -845,8 +700,8 @@ class RamanQtGUI(QMainWindow):
         self._degree_layout = QHBoxLayout()
         self._degree_layout.addWidget(QLabel("阶数:"))
         self.baseline_degree = QComboBox()
-        self.baseline_degree.addItems(["1", "2", "3", "4", "5"])
-        self.baseline_degree.setCurrentIndex(2)
+        self.baseline_degree.addItems(["0", "1", "2", "3", "4", "5"])
+        self.baseline_degree.setCurrentText("3")
         self._degree_layout.addWidget(self.baseline_degree)
         g1l.addLayout(self._degree_layout)
 
@@ -860,9 +715,30 @@ class RamanQtGUI(QMainWindow):
 
         layout.addWidget(g1)
 
-        btn = QPushButton("执行基线校正")
-        btn.clicked.connect(self._on_baseline)
-        layout.addWidget(btn)
+        self.baseline_apply_btn = QPushButton("执行基线校正")
+        self.baseline_apply_btn.clicked.connect(self._on_baseline)
+        layout.addWidget(self.baseline_apply_btn)
+
+        history_actions = QHBoxLayout()
+        self.baseline_undo_btn = QPushButton("撤销")
+        self.baseline_undo_btn.clicked.connect(self._on_undo_processing)
+        history_actions.addWidget(self.baseline_undo_btn)
+        self.baseline_redo_btn = QPushButton("重做")
+        self.baseline_redo_btn.clicked.connect(self._on_redo_processing)
+        history_actions.addWidget(self.baseline_redo_btn)
+        self.baseline_restore_btn = QPushButton("恢复原始")
+        self.baseline_restore_btn.clicked.connect(self._on_restore_raw)
+        history_actions.addWidget(self.baseline_restore_btn)
+        layout.addLayout(history_actions)
+
+        history_group = QGroupBox("处理历史")
+        history_layout = QVBoxLayout(history_group)
+        self.baseline_history_list = QListWidget()
+        self.baseline_history_list.setMaximumHeight(190)
+        self.baseline_history_list.setAlternatingRowColors(True)
+        history_layout.addWidget(self.baseline_history_list)
+        layout.addWidget(history_group)
+        self._update_history_ui()
         layout.addStretch()
 
         self.control_tabs.addTab(tab, "基线校正")
@@ -887,21 +763,115 @@ class RamanQtGUI(QMainWindow):
             self._hide_layout(self._lam_layout)
             self._show_layout(self._degree_layout)
 
+    def _ensure_current_session(self) -> SpectrumSession | None:
+        if self.current_session is None and self.current_spectrum is not None:
+            self.current_session = SpectrumSession(self.current_spectrum)
+            if self.current_cache_key:
+                self.spectrum_sessions[self.current_cache_key] = self.current_session
+        return self.current_session
+
+    def _refresh_from_current_session(self) -> None:
+        self._clear_analysis_results()
+        if self.current_session is None:
+            self._update_history_ui()
+            return
+        self.current_spectrum = self.current_session.current
+        if self._show_auto_peaks:
+            self._detect_peaks()
+        else:
+            self._detected_peaks = []
+            self.peak_table.setRowCount(0)
+        self._update_plot()
+        self._update_history_ui()
+        self._update_axis_dependent_ui()
+
+    def _clear_analysis_results(self):
+        self.snr_result.clear()
+        self.conc_result.clear()
+
+    def _format_history_record(self, record: dict) -> str:
+        timestamp = str(record.get("timestamp", ""))
+        clock = timestamp.split("T", 1)[-1][:8] if "T" in timestamp else timestamp
+        params = record.get("parameters", {})
+        details = ", ".join(f"{key}={value}" for key, value in params.items())
+        source = record.get("source", "")
+        suffix = " | ".join(part for part in (source, details) if part)
+        text = f"{record.get('sequence', '')}. {clock} {record.get('action', '')}"
+        return f"{text}\n{suffix}" if suffix else text
+
+    def _update_history_ui(self) -> None:
+        session = self.current_session
+        busy = self._baseline_worker is not None
+        can_undo = bool(session and session.can_undo and not busy)
+        can_redo = bool(session and session.can_redo and not busy)
+        can_restore = bool(session and not session.is_raw_current and not busy)
+
+        if hasattr(self, "undo_processing_action"):
+            self.undo_processing_action.setEnabled(can_undo)
+            self.redo_processing_action.setEnabled(can_redo)
+            self.restore_raw_action.setEnabled(can_restore)
+        if hasattr(self, "baseline_undo_btn"):
+            self.baseline_undo_btn.setEnabled(can_undo)
+            self.baseline_redo_btn.setEnabled(can_redo)
+            self.baseline_restore_btn.setEnabled(can_restore)
+        if hasattr(self, "baseline_history_list"):
+            self.baseline_history_list.clear()
+            if self.spectrum_sessions.capacity_warning:
+                self.baseline_history_list.addItem(self.spectrum_sessions.capacity_warning)
+            if session is not None:
+                if session.discarded_state_count:
+                    self.baseline_history_list.addItem(
+                        f"较早的 {session.discarded_state_count} 个撤销快照已释放；原始数据与完整操作记录保留"
+                    )
+                for record in session.recent_audit_log:
+                    self.baseline_history_list.addItem(self._format_history_record(record))
+                if self.baseline_history_list.count():
+                    self.baseline_history_list.scrollToBottom()
+
+    def _on_undo_processing(self) -> None:
+        if self._baseline_worker is not None:
+            return
+        session = self._ensure_current_session()
+        if session is None or not session.can_undo:
+            return
+        session.undo()
+        self._refresh_from_current_session()
+        self._log("已撤销上一步光谱处理")
+        self.status_bar.showMessage("已撤销上一步光谱处理")
+
+    def _on_redo_processing(self) -> None:
+        if self._baseline_worker is not None:
+            return
+        session = self._ensure_current_session()
+        if session is None or not session.can_redo:
+            return
+        session.redo()
+        self._refresh_from_current_session()
+        self._log("已重做光谱处理")
+        self.status_bar.showMessage("已重做光谱处理")
+
+    def _on_restore_raw(self) -> None:
+        if self._baseline_worker is not None:
+            return
+        session = self._ensure_current_session()
+        if session is None or session.is_raw_current:
+            return
+        session.restore_raw()
+        self._refresh_from_current_session()
+        self._log("已恢复原始光谱；此前处理历史仍然保留")
+        self.status_bar.showMessage("已恢复原始光谱，可撤销恢复操作")
+
     def _setup_concentration_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        g1 = QGroupBox("浓度结果")
+        g1 = QGroupBox("加权信号占比")
         g1l = QVBoxLayout(g1)
 
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("结果聚焦气体:"))
         self.conc_gas = QComboBox()
-        self.conc_gas.addItems([
-            "N2 (氮气)", "O2 (氧气)", "CO2 (二氧化碳)", "H2O (水蒸气)",
-            "CH4 (甲烷)", "H2 (氢气)", "CO (一氧化碳)",
-            "SO2 (二氧化硫)", "NO (一氧化氮)", "NH3 (氨气)", "C2H6 (乙烷)",
-        ])
+        self._refresh_concentration_gases()
         r1.addWidget(self.conc_gas)
         g1l.addLayout(r1)
 
@@ -911,13 +881,16 @@ class RamanQtGUI(QMainWindow):
         g2l = QVBoxLayout(g2)
 
         r4 = QHBoxLayout()
-        r4.addWidget(QLabel("聚焦气体窗口 (px):"))
+        self.conc_window_label = QLabel("聚焦气体半窗口 (cm⁻¹):")
+        r4.addWidget(self.conc_window_label)
         self.conc_window = QLineEdit("10")
         r4.addWidget(self.conc_window)
         g2l.addLayout(r4)
+        self.conc_gas.currentIndexChanged.connect(self._on_concentration_gas_changed)
+        self._on_concentration_gas_changed()
 
         r5 = QHBoxLayout()
-        r5.addWidget(QLabel("浓度算法:"))
+        r5.addWidget(QLabel("归一化方法:"))
         self.conc_strategy = QComboBox()
         self.conc_strategy.addItems(["峰高归一化 (peak_max)", "峰面积归一化 (peak_area)"])
         r5.addWidget(self.conc_strategy)
@@ -925,16 +898,20 @@ class RamanQtGUI(QMainWindow):
 
         layout.addWidget(g2)
 
-        btn = QPushButton("计算 O2/N2/CO2 浓度")
-        btn.clicked.connect(self._on_concentration)
-        layout.addWidget(btn)
+        self.conc_calculate_btn = QPushButton("计算气体库定量结果")
+        self.conc_calculate_btn.clicked.connect(self._on_concentration)
+        layout.addWidget(self.conc_calculate_btn)
 
         self.conc_result = QLabel("")
         self.conc_result.setWordWrap(True)
         layout.addWidget(self.conc_result)
 
+        note = QLabel("结果表示启用定量气体的加权信号占比。实际组分浓度需经标准样品校准验证；默认系数 1 不代表已校准。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
         layout.addStretch()
-        self.control_tabs.addTab(tab, "气体浓度")
+        self.control_tabs.addTab(tab, "气体信号占比")
 
     def _setup_batch_tab(self):
         tab = QWidget()
@@ -946,9 +923,13 @@ class RamanQtGUI(QMainWindow):
         self.batch_baseline_cb = QCheckBox("执行基线校正")
         g1l.addWidget(self.batch_baseline_cb)
 
-        btn = QPushButton("开始批量处理")
-        btn.clicked.connect(self._on_batch)
-        g1l.addWidget(btn)
+        self.batch_start_btn = QPushButton("开始批量处理")
+        self.batch_start_btn.clicked.connect(self._on_batch)
+        g1l.addWidget(self.batch_start_btn)
+        self.batch_cancel_btn = QPushButton("取消批量任务")
+        self.batch_cancel_btn.setEnabled(False)
+        self.batch_cancel_btn.clicked.connect(self._on_cancel_batch)
+        g1l.addWidget(self.batch_cancel_btn)
 
         layout.addWidget(g1)
 
@@ -1027,7 +1008,7 @@ class RamanQtGUI(QMainWindow):
         self.cal_px2 = QLineEdit()
         self.cal_px2.setPlaceholderText("如 800")
         cr2.addWidget(self.cal_px2)
-        cr2.addWidget(QLabel("cm-1:"))
+        cr2.addWidget(QLabel("cm⁻¹:"))
         self.cal_rs2 = QLineEdit()
         self.cal_rs2.setPlaceholderText("如 2331 (N2)")
         cr2.addWidget(self.cal_rs2)
@@ -1038,7 +1019,7 @@ class RamanQtGUI(QMainWindow):
         g3l.addWidget(self.cal_status)
 
         # 气体峰位显示开关
-        self.gas_peaks_cb = QCheckBox("显示参考气体峰位 (N₂, O₂, CO₂...)")
+        self.gas_peaks_cb = QCheckBox("显示气体库参考峰位")
         self.gas_peaks_cb.setChecked(True)
         self.gas_peaks_cb.toggled.connect(self._on_gas_peaks_toggled)
         g3l.addWidget(self.gas_peaks_cb)
@@ -1080,18 +1061,13 @@ class RamanQtGUI(QMainWindow):
 
     def _get_calibration(self) -> tuple[float, float] | None:
         """从校准输入计算线性校准参数 (a, b) 使得 raman = a * pixel + b."""
-        try:
-            px1 = float(self.cal_px1.text())
-            rs1 = float(self.cal_rs1.text())
-            px2 = float(self.cal_px2.text())
-            rs2 = float(self.cal_rs2.text())
-        except ValueError:
+        fields = [self.cal_px1.text().strip(), self.cal_rs1.text().strip(),
+                  self.cal_px2.text().strip(), self.cal_rs2.text().strip()]
+        if not any(fields):
             return None
-        if px1 == px2:
-            return None
-        a = (rs2 - rs1) / (px2 - px1)
-        b = rs1 - a * px1
-        return (a, b)
+        if not all(fields):
+            raise ValueError("请填写完整的两点校准参数，或清空全部校准字段")
+        return calibration_from_points(*fields)
 
     def _on_gas_peaks_toggled(self, checked):
         self._show_gas_peaks = checked
@@ -1102,6 +1078,21 @@ class RamanQtGUI(QMainWindow):
         if checked and self.current_spectrum:
             self._detect_peaks()
         self._update_plot()
+
+    def _update_axis_dependent_ui(self):
+        spectrum = self.current_spectrum
+        has_raman_axis = bool(spectrum and spectrum.is_raman_shift)
+        has_quantitative_gas = bool(self.conc_gas.currentData()) if hasattr(self, "conc_gas") else False
+        if hasattr(self, "gas_peaks_cb"):
+            self.gas_peaks_cb.setEnabled(has_raman_axis)
+            self.gas_peaks_cb.setToolTip(
+                "" if has_raman_axis else "气体库峰位使用 cm⁻¹；请先完成拉曼位移校准"
+            )
+        if hasattr(self, "conc_calculate_btn"):
+            self.conc_calculate_btn.setEnabled(has_raman_axis and has_quantitative_gas)
+            self.conc_gas.setEnabled(has_raman_axis)
+            self.conc_window.setEnabled(has_raman_axis)
+            self.conc_strategy.setEnabled(has_raman_axis)
 
     def _detect_peaks(self):
         if self.current_spectrum is None:
@@ -1120,7 +1111,7 @@ class RamanQtGUI(QMainWindow):
             row = self.peak_table.rowCount()
             self.peak_table.insertRow(row)
             gas = p.get("matched_gas") or "—"
-            unit = "cm-1" if self.current_spectrum and self.current_spectrum.metadata.get("calibration") else "px"
+            unit = self.current_spectrum.x_unit_label if self.current_spectrum else ""
             self.peak_table.setItem(row, 0, QTableWidgetItem(gas))
             self.peak_table.setItem(row, 1, QTableWidgetItem(f"{p['center']:.1f} {unit}"))
             self.peak_table.setItem(row, 2, QTableWidgetItem(f"{p['height']:.0f}"))
@@ -1149,7 +1140,7 @@ class RamanQtGUI(QMainWindow):
         self.log_widget.append(text)
 
     def _on_open_files(self):
-        patterns = "光谱文件 (*.txt *.asc *.sif *.tif *.tiff *.bmp);;所有文件 (*.*)"
+        patterns = "光谱文件 (*.txt *.asc *.sif *.tif *.tiff *.bmp *.jpg *.jpeg);;所有文件 (*.*)"
         files, _ = QFileDialog.getOpenFileNames(self, "选择光谱文件", "", patterns)
         if files:
             self._add_files(files)
@@ -1157,12 +1148,7 @@ class RamanQtGUI(QMainWindow):
     def _on_open_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择包含光谱文件的目录")
         if dir_path:
-            supported = set(SUPPORTED_FORMATS.keys())
-            dir_p = Path(dir_path)
-            all_files = []
-            for ext in supported:
-                all_files.extend(sorted(dir_p.glob(f"*{ext}")))
-                all_files.extend(sorted(dir_p.glob(f"*{ext.upper()}")))
+            all_files = collect_spectrum_files(dir_path)
             if all_files:
                 self._add_files([str(f) for f in all_files])
             else:
@@ -1187,19 +1173,46 @@ class RamanQtGUI(QMainWindow):
 
         if added > 0:
             self.status_bar.showMessage(f"已添加 {added} 个文件")
+            self._sort_file_list()
             if self.file_list.count() == 1:
                 self.file_list.setCurrentRow(0)
                 self._load_selected_file()
 
+    def _sort_file_list(self):
+        files = [
+            self.file_list.item(i).data(Qt.UserRole)
+            for i in range(self.file_list.count())
+        ]
+        self.file_list.clear()
+        for f in natural_sorted(files):
+            item = QListWidgetItem(Path(f).name)
+            item.setData(Qt.UserRole, f)
+            item.setToolTip(f)
+            self.file_list.addItem(item)
+
     def _on_remove_file(self):
+        self._invalidate_loads()
         for item in self.file_list.selectedItems():
+            filepath = str(item.data(Qt.UserRole) or "")
             row = self.file_list.row(item)
             self.file_list.takeItem(row)
+            for cache_key in [key for key in self.spectrum_sessions if key.startswith(f"{filepath}|")]:
+                self.spectrum_sessions.pop(cache_key, None)
 
     def _on_clear_files(self):
+        self._invalidate_loads()
+        if self._baseline_worker is not None:
+            self._baseline_worker.requestInterruption()
         self.file_list.clear()
-        self.loaded_spectra.clear()
+        self.spectrum_sessions.clear()
+        self.current_session = None
+        self.current_cache_key = ""
+        self.current_file = ""
         self.current_spectrum = None
+        self._clear_analysis_results()
+        self.cal_status.clear()
+        self._update_history_ui()
+        self._update_axis_dependent_ui()
         self._clear_canvas()
 
     def _on_file_double_click(self, item):
@@ -1224,38 +1237,15 @@ class RamanQtGUI(QMainWindow):
 
     def _open_image_viewer(self, filepath: str):
         try:
-            from PIL import Image
-            from raman_tool.readers.tif_reader import _merge_columns, _parse_row_groups
+            from raman_tool.readers.image_reader import load_image_array, reduce_image_array
 
-            img = Image.open(filepath)
-            arr = np.array(img)
-            if arr.ndim == 3:
-                arr = np.mean(arr[:, :, :3], axis=2)
-            elif arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            arr = arr.astype(np.float64, copy=False)
-
+            arr, _ = load_image_array(filepath, grayscale=Path(filepath).suffix.lower() in {".jpg", ".jpeg"})
             row_groups = self.img_row_groups.text().strip()
-            if row_groups:
-                rows = arr.shape[0]
-                selected_blocks = []
-                for start, end in _parse_row_groups(row_groups):
-                    s = max(0, start - 1)
-                    e = min(rows, end)
-                    if s < e:
-                        selected_blocks.append(arr[s:e, :])
-                if not selected_blocks:
-                    raise ValueError(f"行分组 '{row_groups}' 未匹配到有效范围 (总行数 {rows})")
-                arr = np.concatenate(selected_blocks, axis=0)
-
-            try:
-                col_merge = max(1, int(self.img_col_merge.text()))
-            except ValueError:
-                col_merge = 1
-            if col_merge > 1:
-                arr = _merge_columns(arr, col_merge)
+            col_merge = integer_parameter(self.img_col_merge.text(), "列合并", minimum=1)
+            arr, _ = reduce_image_array(arr, row_groups=row_groups or None, col_merge=col_merge)
 
             viewer = ImageViewerWindow(filepath, arr, self)
+            viewer.setAttribute(Qt.WA_DeleteOnClose)
             if row_groups or col_merge > 1:
                 viewer.setWindowTitle(
                     f"图像 - {Path(filepath).name} | 行: {row_groups or '全部'} | 列合并: {col_merge}"
@@ -1272,8 +1262,17 @@ class RamanQtGUI(QMainWindow):
         self._load_file(filepath)
 
     def _load_file(self, filepath: str, row_groups: str | None = None, col_merge: int = 1):
+        if self._closing or self._capacity_blocked():
+            return
+        self._invalidate_loads()
         suffix = Path(filepath).suffix.lower()
-        calibration = self._get_calibration()
+        try:
+            calibration = self._get_calibration()
+            if suffix in (".tif", ".tiff", ".bmp", ".jpg", ".jpeg") and col_merge == 1:
+                col_merge = integer_parameter(self.img_col_merge.text(), "列合并", minimum=1)
+        except ValueError as exc:
+            QMessageBox.warning(self, "参数错误", str(exc))
+            return
         row_mode = "sum" if self.row_mode_combo.currentIndex() == 1 else "mean"
 
         # TIF/BMP/JPG: 从「图像设置」面板读取行/列参数
@@ -1281,22 +1280,25 @@ class RamanQtGUI(QMainWindow):
             if row_groups is None:
                 rg_text = self.img_row_groups.text().strip()
                 row_groups = rg_text if rg_text else None
-            if col_merge == 1:
-                try:
-                    col_merge = max(1, int(self.img_col_merge.text()))
-                except ValueError:
-                    col_merge = 1
 
         self.status_bar.showMessage(f"正在载入 {Path(filepath).name}...")
         self._log(f"载入: {Path(filepath).name}")
 
-        cache_key = f"{filepath}|rows={row_groups}|cols={col_merge}|mode={row_mode}|cal={calibration}"
-        if cache_key in self.loaded_spectra:
-            self.current_spectrum = self.loaded_spectra[cache_key]
+        try:
+            baseline_options = self._get_baseline_options() if self.auto_baseline_cb.isChecked() else None
+        except ValueError as exc:
+            QMessageBox.critical(self, "基线参数错误", str(exc))
+            return
+        baseline_key = tuple(sorted(baseline_options.items())) if baseline_options else None
+        cache_key = (
+            f"{filepath}|rows={row_groups}|cols={col_merge}|mode={row_mode}|"
+            f"cal={calibration}|baseline={baseline_key}"
+        )
+        if cache_key in self.spectrum_sessions:
+            self.current_session = self.spectrum_sessions[cache_key]
+            self.current_cache_key = cache_key
             self.current_file = filepath
-            if self._show_auto_peaks:
-                self._detect_peaks()
-            self._update_plot()
+            self._refresh_from_current_session()
             self.status_bar.showMessage(f"已应用图像设置: {Path(filepath).name}")
             return
 
@@ -1307,21 +1309,24 @@ class RamanQtGUI(QMainWindow):
             calibration=calibration,
             row_mode=row_mode,
             cache_key=cache_key,
+            baseline_options=baseline_options,
+            request_id=self._load_request,
         )
         self.load_thread.finished_loading.connect(self._on_spectrum_loaded)
         self.load_thread.error_occurred.connect(self._on_load_error)
-        self.load_thread.start()
+        self._workers.start(self.load_thread)
 
-    def _on_spectrum_loaded(self, spectrum: Spectrum, filepath: str, cache_key: str):
-        # 自动基线校正
-        if self.auto_baseline_cb.isChecked():
-            try:
-                spectrum = subtract_baseline(spectrum, method="arPLS")
-                self._log("  已自动执行基线校正 (arPLS)")
-            except Exception as e:
-                self._log(f"  自动基线校正失败: {e}")
-
-        self.loaded_spectra[cache_key] = spectrum
+    def _on_spectrum_loaded(self, session: SpectrumSession, filepath: str, cache_key: str):
+        worker = self.sender()
+        if self._closing or worker.request_id != self._load_request:
+            return
+        if worker.baseline_options is not None:
+            self._log(f"  已自动执行基线校正 ({self._format_baseline_options(worker.baseline_options)})")
+        self._clear_analysis_results()
+        self.spectrum_sessions[cache_key] = session
+        self.current_session = session
+        self.current_cache_key = cache_key
+        spectrum = session.current
         self.current_spectrum = spectrum
         self.current_file = filepath
 
@@ -1330,21 +1335,27 @@ class RamanQtGUI(QMainWindow):
             self._detect_peaks()
 
         self._update_plot()
+        self._update_history_ui()
+        self._update_axis_dependent_ui()
         n = spectrum.size
         xr = f"{spectrum.raman_shift[0]:.1f} - {spectrum.raman_shift[-1]:.1f}"
         yr = f"{spectrum.intensity.min():.1f} - {spectrum.intensity.max():.1f}"
 
-        cal = spectrum.metadata.get("calibration")
-        unit = "cm-1" if cal else "px"
+        unit = spectrum.x_unit_label
         self.status_bar.showMessage(
             f"已载入: {Path(filepath).name} | 数据点: {n} | 范围: {xr} {unit} | 强度: {yr}"
         )
-        self._log(f"  数据点: {n}, 拉曼位移: {xr} {unit}, 强度: {yr}")
+        self._log(f"  数据点: {n}, 横轴范围: {xr} {unit}, 强度: {yr}")
+        cal = spectrum.metadata.get("calibration")
         if cal:
             a, b = cal
             self.cal_status.setText(f"当前校准: raman = {a:.4f} * pixel + {b:.2f}")
+        else:
+            self.cal_status.setText("" if spectrum.is_raman_shift else "当前横轴为像素，尚未校准")
 
     def _on_load_error(self, error: str):
+        if self._closing or self.sender().request_id != self._load_request:
+            return
         self.status_bar.showMessage("载入失败")
         self._log(f"[错误] 载入失败: {error}")
 
@@ -1422,12 +1433,13 @@ class RamanQtGUI(QMainWindow):
             color = "green" if mode == "signal" else "red"
 
             def on_select(xmin, xmax):
+                unit = self.current_spectrum.x_unit_label if self.current_spectrum else ""
                 if mode == "signal":
                     self.snr_signal_range = (xmin, xmax)
-                    self.snr_signal_label.setText(f"信号: {xmin:.1f} ~ {xmax:.1f} px")
+                    self.snr_signal_label.setText(f"信号: {xmin:.1f} ~ {xmax:.1f} {unit}")
                 else:
                     self.snr_noise_range = (xmin, xmax)
-                    self.snr_noise_label.setText(f"噪声: {xmin:.1f} ~ {xmax:.1f} px")
+                    self.snr_noise_label.setText(f"噪声: {xmin:.1f} ~ {xmax:.1f} {unit}")
                 self.status_bar.showMessage(f"{'信号' if mode == 'signal' else '噪声'}区域已选择")
                 self._update_plot()
 
@@ -1523,8 +1535,7 @@ class RamanQtGUI(QMainWindow):
     def _update_cursor_status(self):
         if self._cursor_x is None:
             return
-        cal = self.current_spectrum.metadata.get("calibration") if self.current_spectrum else None
-        unit = "cm-1" if cal else "px"
+        unit = self.current_spectrum.x_unit_label if self.current_spectrum else ""
         self.status_bar.showMessage(
             f"光标: x={self._cursor_x:.2f} {unit}  强度={self._cursor_y:.1f}  |  方向键移动 | 右键取消 | Esc 取消"
         )
@@ -1537,6 +1548,18 @@ class RamanQtGUI(QMainWindow):
         if self._cursor_v_line is not None:
             self._cursor_v_line.set_visible(False)
         self._cursor_lines = []
+
+    def _confirm_overwrite_path(self, path: Path) -> bool:
+        if not path.exists():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "确认覆盖",
+            f"文件已存在，是否覆盖？\n{path}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
 
     def _clear_canvas(self):
         if self._placeholder:
@@ -1565,12 +1588,72 @@ class RamanQtGUI(QMainWindow):
             "PNG 图片 (*.png);;PDF 文档 (*.pdf);;SVG 矢量图 (*.svg)"
         )
         if filepath:
+            path = Path(filepath)
+            if not self._confirm_overwrite_path(path):
+                return
             try:
-                save_figure(self.current_figure, filepath)
+                save_figure(self.current_figure, path)
                 self._log(f"图表已导出: {filepath}")
                 self.status_bar.showMessage(f"已导出: {filepath}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败: {e}")
+
+    def _on_export_spectrum(self):
+        if self.current_spectrum is None:
+            QMessageBox.warning(self, "提示", "请先载入光谱文件")
+            return
+
+        default_name = Path(self.current_file).with_suffix(".asc").name if self.current_file else "spectrum.asc"
+        filepath, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出当前光谱数据",
+            default_name,
+            "ASC 文件 (*.asc);;TXT 文件 (*.txt)",
+        )
+        if not filepath:
+            return
+        suffix = ".txt" if "TXT" in selected_filter.upper() else ".asc"
+        path = normalize_export_path(filepath, suffix)
+        if not self._confirm_overwrite_path(path):
+            return
+        try:
+            spectrum = (
+                self.current_session.spectrum_for_export()
+                if self.current_session is not None
+                else self.current_spectrum
+            )
+            path = export_spectrum(spectrum, path, overwrite=True, include_history=True)
+            self._log(f"当前光谱数据已导出: {path}")
+            self.status_bar.showMessage(f"已导出当前光谱数据: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出当前光谱数据失败: {e}")
+
+    def _on_export_raw_spectrum(self):
+        session = self._ensure_current_session()
+        if session is None:
+            QMessageBox.warning(self, "提示", "请先载入光谱文件")
+            return
+
+        source = Path(self.current_file) if self.current_file else Path("spectrum")
+        default_name = f"{source.stem}_original.asc"
+        filepath, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出原始光谱数据",
+            default_name,
+            "ASC 文件 (*.asc);;TXT 文件 (*.txt)",
+        )
+        if not filepath:
+            return
+        suffix = ".txt" if "TXT" in selected_filter.upper() else ".asc"
+        path = normalize_export_path(filepath, suffix)
+        if not self._confirm_overwrite_path(path):
+            return
+        try:
+            path = export_spectrum(session.raw, path, overwrite=True)
+            self._log(f"原始光谱数据已导出: {path}")
+            self.status_bar.showMessage(f"已导出原始光谱数据: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出原始光谱数据失败: {e}")
 
     def _on_calc_snr(self):
         if self.current_spectrum is None:
@@ -1596,7 +1679,7 @@ class RamanQtGUI(QMainWindow):
                 f"SNR: {result['snr']:.2f}\n"
                 f"信号强度: {result['signal']:.2f}\n"
                 f"噪声 RMS: {result['noise_rms']:.4f}\n"
-                f"峰中心: {result['peak_center']:.2f} px"
+                f"峰中心: {result['peak_center']:.2f} {self.current_spectrum.x_unit_label}"
             )
             if result["peak_area"] > 0:
                 text += f"\n峰面积: {result['peak_area']:.4f}"
@@ -1609,35 +1692,52 @@ class RamanQtGUI(QMainWindow):
             QMessageBox.warning(self, "参数错误", f"请检查输入: {e}")
 
     def _on_baseline(self):
+        if self._closing or self._baseline_worker is not None or self._capacity_blocked():
+            return
         if self.current_spectrum is None:
             QMessageBox.warning(self, "提示", "请先载入光谱文件")
             return
 
         try:
-            method_idx = self.baseline_method.currentIndex()
-            method = "arPLS" if method_idx == 0 else "poly"
-
-            self.status_bar.showMessage(f"正在进行基线校正 ({method})...")
-
-            if method == "arPLS":
-                lam_text = self.baseline_lam.text().strip()
-                lam = float(lam_text) if lam_text else 1e5
-                corrected = subtract_baseline(self.current_spectrum, method="arPLS", lam=lam)
-                self._log(f"基线校正完成 (arPLS, lam={lam:.1e})")
-            else:
-                degree = int(self.baseline_degree.currentText())
-                corrected = subtract_baseline(self.current_spectrum, method="poly", degree=degree)
-                self._log(f"基线校正完成 (poly, degree={degree})")
-
-            # 直接在原图位置更新光谱
-            self.current_spectrum = corrected
-            if self._show_auto_peaks:
-                self._detect_peaks()
-            self._update_plot()
-            self.status_bar.showMessage("基线校正完成 — 图表已更新")
+            session = self._ensure_current_session()
+            if session is None:
+                return
+            options = self._get_baseline_options()
+            self.status_bar.showMessage(
+                f"正在进行基线校正 ({self._format_baseline_options(options)})..."
+            )
+            worker = BaselineThread(session, options)
+            self._baseline_worker = worker
+            worker.completed.connect(self._on_baseline_done)
+            worker.error_occurred.connect(self._on_baseline_error)
+            self.baseline_apply_btn.setEnabled(False)
+            self._update_history_ui()
+            self._workers.start(worker)
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"校正失败: {e}")
+
+    def _capacity_blocked(self):
+        warning = self.spectrum_sessions.capacity_warning
+        if warning:
+            QMessageBox.warning(self, "缓存容量已满", warning)
+        return bool(warning)
+
+    def _on_baseline_done(self, corrected):
+        worker = self.sender()
+        if self._closing or worker.session is not self.current_session:
+            return
+        if worker.session.revision != worker.revision:
+            self._log("基线计算期间处理状态已改变，已忽略过期结果")
+            return
+        worker.session.apply(corrected, "基线校正", worker.options, "手动")
+        self._refresh_from_current_session()
+        self._log(f"基线校正完成 ({self._format_baseline_options(worker.options)})")
+        self.status_bar.showMessage("基线校正完成；原始数据和处理历史已保留")
+
+    def _on_baseline_error(self, error):
+        if not self._closing and self.sender().session is self.current_session:
+            QMessageBox.critical(self, "错误", f"校正失败: {error}")
 
     def _on_concentration(self):
         if self.current_spectrum is None:
@@ -1645,35 +1745,46 @@ class RamanQtGUI(QMainWindow):
             return
 
         try:
-            gas_text = self.conc_gas.currentText()
-            gas_name = gas_text.split()[0]
+            gas_name = self.conc_gas.currentData()
+            if not gas_name:
+                raise ValueError("气体峰位库中没有启用定量的气体")
             window = float(self.conc_window.text())
             strategy = "peak_area" if self.conc_strategy.currentIndex() == 1 else "peak_max"
 
             result = calculate_concentration(
                 self.current_spectrum,
-                gas_name=gas_name,
+                gas_name=str(gas_name),
                 window=window,
-                reference_gas="N2",
-                reference_concentration=78.0,
                 strategy=strategy,
             )
             all_conc = result.get("all_concentrations", {})
             percentages = all_conc.get("percentages", {})
             peaks = all_conc.get("peaks", {})
+            gas_library = get_gas_library()
+            unit = self.current_spectrum.x_unit_label
+
+            gas_lines = []
+            for gas, percentage in percentages.items():
+                info = gas_library.get(gas, {})
+                name = str(info.get("name") or gas)
+                peak = peaks.get(gas, {})
+                gas_lines.append(
+                    f"{gas} ({name}): {percentage:.4f}%  "
+                    f"I={peak.get('intensity', 0.0):.4f}  "
+                    f"峰位={peak.get('center', 0.0):.2f} {unit}"
+                )
 
             text = (
-                f"气体: {result['gas']}\n"
-                f"浓度: {result['concentration']:.4f} %\n"
-                f"峰中心: {result['peak_center']:.2f} px\n"
+                f"聚焦气体: {result['gas']} ({result['gas_key']})\n"
+                f"加权信号占比: {result['concentration']:.4f}%\n"
+                f"峰中心: {result['peak_center']:.2f} {unit}\n"
                 f"峰高: {result['peak_height']:.4f}\n"
-                f"峰面积: {result['peak_area']:.4f}\n"
-                f"\nO2: {percentages.get('O2', 0.0):.4f}%  I={peaks.get('O2', {}).get('intensity', 0.0):.4f}\n"
-                f"N2: {percentages.get('N2', 0.0):.4f}%  I={peaks.get('N2', {}).get('intensity', 0.0):.4f}\n"
-                f"CO2: {percentages.get('CO2', 0.0):.4f}%  I={peaks.get('CO2', {}).get('intensity', 0.0):.4f}"
+                f"峰面积: {result['peak_area']:.4f}\n\n"
+                + "\n".join(gas_lines)
+                + "\n\n" + "\n".join(all_conc.get("warnings", []))
             )
             self.conc_result.setText(text)
-            self._log("=== 气体浓度计算 ===\n" + text.replace("\n", "\n  "))
+            self._log("=== 气体加权信号占比 ===\n" + text.replace("\n", "\n  "))
 
         except ValueError as e:
             QMessageBox.warning(self, "错误", str(e))
@@ -1681,6 +1792,8 @@ class RamanQtGUI(QMainWindow):
             QMessageBox.critical(self, "错误", f"计算失败: {e}")
 
     def _on_batch(self):
+        if self._closing or self._batch_worker is not None:
+            return
         if self.file_list.count() == 0:
             QMessageBox.warning(self, "提示", "请先添加文件到列表")
             return
@@ -1691,10 +1804,18 @@ class RamanQtGUI(QMainWindow):
         rg_text = self.img_row_groups.text().strip()
         row_groups = rg_text if rg_text else None
         try:
-            col_merge = max(1, int(self.img_col_merge.text()))
-        except ValueError:
-            col_merge = 1
-        calibration = self._get_calibration()
+            col_merge = integer_parameter(self.img_col_merge.text(), "列合并", minimum=1)
+            calibration = self._get_calibration()
+            baseline_options = self._get_baseline_options() if do_baseline else None
+            focus_gas = self.conc_gas.currentData()
+            window = positive_float(self.conc_window.text(), "定量半窗口")
+            windows = None
+            if focus_gas:
+                info = get_gas_library()[focus_gas]
+                windows = {focus_gas: (float(info["center"]), window)}
+        except ValueError as exc:
+            QMessageBox.warning(self, "参数错误", str(exc))
+            return
         row_mode = "sum" if self.row_mode_combo.currentIndex() == 1 else "mean"
         strategy = "peak_area" if self.conc_strategy.currentIndex() == 1 else "peak_max"
 
@@ -1710,28 +1831,118 @@ class RamanQtGUI(QMainWindow):
             calibration=calibration,
             row_mode=row_mode,
             strategy=strategy,
+            baseline_options=baseline_options,
+            windows=windows,
         )
         self.batch_thread.progress_update.connect(self._on_batch_progress)
         self.batch_thread.file_done.connect(self._on_batch_file_done)
         self.batch_thread.all_done.connect(self._on_batch_done)
-        self.batch_thread.start()
+        self._start_batch_worker(self.batch_thread)
+
+    def _on_export_all_spectra(self):
+        if self._closing or self._batch_worker is not None:
+            return
+        if self.file_list.count() == 0:
+            QMessageBox.warning(self, "提示", "请先添加文件到列表")
+            return
+
+        format_text, ok = QInputDialog.getItem(
+            self,
+            "导出全部光谱数据",
+            "导出格式:",
+            ["ASC (*.asc)", "TXT (*.txt)"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(self, "选择光谱数据导出目录")
+        if not output_dir:
+            return
+
+        files = [Path(self.file_list.item(i).data(Qt.UserRole))
+                for i in range(self.file_list.count())]
+        rg_text = self.img_row_groups.text().strip()
+        row_groups = rg_text if rg_text else None
+        try:
+            col_merge = integer_parameter(self.img_col_merge.text(), "列合并", minimum=1)
+            calibration = self._get_calibration()
+            baseline_options = self._get_baseline_options() if self.batch_baseline_cb.isChecked() else None
+        except ValueError as exc:
+            QMessageBox.warning(self, "参数错误", str(exc))
+            return
+        row_mode = "sum" if self.row_mode_combo.currentIndex() == 1 else "mean"
+        suffix = ".txt" if format_text.startswith("TXT") else ".asc"
+
+        self.batch_progress.setVisible(True)
+        self.batch_progress.setMaximum(len(files))
+        self.batch_progress.setValue(0)
+        self.batch_status.setText("正在批量导出光谱数据...")
+
+        self.batch_export_thread = BatchExportThread(
+            files,
+            Path(output_dir),
+            suffix,
+            do_baseline=self.batch_baseline_cb.isChecked(),
+            row_groups=row_groups,
+            col_merge=col_merge,
+            calibration=calibration,
+            row_mode=row_mode,
+            baseline_options=baseline_options,
+        )
+        self.batch_export_thread.progress_update.connect(self._on_batch_progress)
+        self.batch_export_thread.file_done.connect(self._on_batch_file_done)
+        self.batch_export_thread.all_done.connect(self._on_batch_export_done)
+        self._start_batch_worker(self.batch_export_thread)
+
+    def _start_batch_worker(self, worker):
+        self._batch_worker = worker
+        self.last_batch_failures = []
+        self.batch_start_btn.setEnabled(False)
+        self.batch_cancel_btn.setEnabled(True)
+        self._workers.start(worker)
 
     def _on_batch_progress(self, current: int, total: int):
         self.batch_progress.setValue(current)
 
-    def _on_batch_file_done(self, filename: str, success: bool):
+    def _on_batch_file_done(self, filename: str, success: bool, reason: str = ""):
+        if self._closing:
+            return
         if success:
             self._log(f"  ✓ {filename}")
         else:
-            self._log(f"  ✗ {filename}")
+            self._log(f"  ✗ {filename}: {reason}")
 
     def _on_batch_done(self, ok: int, fail: int, results: list):
+        worker = self.sender()
+        self.last_batch_failures = list(worker.failures)
+        if self._closing:
+            return
         self.batch_progress.setVisible(False)
-        self.batch_status.setText(f"完成: {ok} 成功, {fail} 失败")
+        state = "已取消" if worker.cancelled else "完成"
+        self.batch_status.setText(f"{state}: {ok} 成功, {fail} 失败")
         self._log(f"批量处理完成: {ok} 成功, {fail} 失败")
-        if results:
-            dialog = ConcentrationResultDialog(results, self)
-            dialog.exec()
+        if results or self.last_batch_failures:
+            dialog = ConcentrationResultDialog(results, self, failures=self.last_batch_failures)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            dialog.show()
+
+    def _on_batch_export_done(self, ok: int, fail: int, output_dir: str):
+        worker = self.sender()
+        self.last_batch_failures = list(worker.failures)
+        if self._closing:
+            return
+        self.batch_progress.setVisible(False)
+        state = "已取消" if worker.cancelled else "导出完成"
+        self.batch_status.setText(f"{state}: {ok} 成功, {fail} 失败")
+        self._log(f"批量导出光谱数据完成: {ok} 成功, {fail} 失败, 输出目录: {output_dir}")
+        if fail:
+            self._log("导出失败明细已保留，可从日志查看文件名与原因")
+        if worker.failure_report_path:
+            self._log(f"导出失败报告: {worker.failure_report_path}")
+        if worker.report_error:
+            self._log(f"无法保存失败报告: {worker.report_error}")
 
     def _on_about(self):
         QMessageBox.about(

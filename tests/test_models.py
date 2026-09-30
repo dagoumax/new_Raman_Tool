@@ -48,3 +48,52 @@ class TestSpectrum:
     def test_metadata(self):
         spec = Spectrum(TEST_X, TEST_Y, metadata={"key": "value"})
         assert spec.metadata["key"] == "value"
+
+    def test_axis_unit_defaults_to_raman_shift_for_legacy_spectra(self):
+        spec = Spectrum(TEST_X, TEST_Y)
+
+        assert spec.x_unit == "cm-1"
+        assert spec.x_unit_label == "cm⁻¹"
+        assert spec.is_raman_shift
+
+    def test_pixel_axis_has_distinct_labels(self):
+        spec = Spectrum(TEST_X, TEST_Y, metadata={"x_unit": "pixels"})
+
+        assert spec.x_unit == "px"
+        assert spec.x_label == "像素位置 (px)"
+        assert spec.x_plot_label == "像素位置 (px)"
+        assert not spec.is_raman_shift
+
+
+@pytest.mark.parametrize("x,y", [
+    ([], []),
+    ([[1, 2]], [[3, 4]]),
+    (1, 2),
+    ([1, 2], [3, np.nan]),
+    ([1, np.inf], [3, 4]),
+    ([1, 2], [3 + 1j, 4]),
+    ([True, False], [1, 2]),
+    ([1, 1, 2], [1, 2, 3]),
+    ([1, 3, 2], [1, 2, 3]),
+])
+def test_invalid_spectrum_data_rejected(x, y):
+    with pytest.raises(ValueError):
+        Spectrum(x, y)
+
+
+def test_descending_spectrum_preserves_order():
+    spectrum = Spectrum((3, 2, 1), (10, 20, 30))
+    np.testing.assert_array_equal(spectrum.raman_shift, [3, 2, 1])
+    assert spectrum.intensity.dtype == np.float64
+
+
+@pytest.mark.parametrize("unit", ["nm", "unknown", 0, False])
+def test_unknown_axis_unit_is_not_assumed_calibrated(unit):
+    with pytest.raises(ValueError, match="unit"):
+        Spectrum([1, 2], [3, 4], metadata={"x_unit": unit})
+
+
+@pytest.mark.parametrize("start,end", [(500, 100), (100, 100), (100, np.inf), (600, 700)])
+def test_crop_rejects_invalid_or_empty_region(start, end):
+    with pytest.raises(ValueError):
+        Spectrum(TEST_X, TEST_Y).crop(start, end)

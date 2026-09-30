@@ -35,3 +35,10 @@ launch_raman_tool_hidden.vbs
 
 # Large local camera frames
 test_data/TS_*.tif
+
+# Local measured-reference reports (source files remain outside the repository)
+validation/local_sample_import_audit.json
+validation/user_reference_strategy_comparison.*
+validation/user_reference_summary.md
+validation/user_reference_comparison.png
+validation/local-reports/

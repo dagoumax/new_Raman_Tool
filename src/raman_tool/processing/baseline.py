@@ -8,6 +8,8 @@ import numpy as np
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from raman_tool.models import Spectrum
+from raman_tool.safety import check_baseline_points
+from raman_tool.validation import integer_parameter, numeric_vector, positive_float, validate_spectrum_arrays
 
 
 def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6) -> np.ndarray:
@@ -24,8 +26,14 @@ def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6
     Returns:
         baseline: 估计的基线 (与 y 同形状)
     """
-    y = np.asarray(y, dtype=np.float64).flatten()
+    y = numeric_vector(y, "arPLS signal", minimum=3)
+    lam = positive_float(lam, "lam")
+    max_iter = integer_parameter(max_iter, "max_iter", minimum=1)
+    tol = positive_float(tol, "tol")
+    if tol >= 1:
+        raise ValueError("tol must be less than 1")
     N = len(y)
+    check_baseline_points(N)
 
     # 稀疏二阶差分矩阵
     D = diags([1, -2, 1], [0, 1, 2], shape=(N - 2, N), format="csc")
@@ -38,6 +46,8 @@ def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6
         A = W + lam * DTD
         b = w * y
         z = spsolve(A, b)
+        if not np.all(np.isfinite(z)):
+            raise ValueError("arPLS failed to produce a finite baseline; check signal scale and lam")
 
         d = y - z
         idx = d < 0  # y < z 的区域 (信号)
@@ -64,6 +74,8 @@ def arPLS(y: np.ndarray, lam: float = 1e5, max_iter: int = 50, tol: float = 1e-6
 
         w = w_new
 
+    if not np.all(np.isfinite(z)):
+        raise ValueError("arPLS failed to produce a finite baseline; check signal scale and lam")
     return z
 
 
@@ -77,10 +89,15 @@ def poly_baseline(spectrum: Spectrum, degree: int = 3) -> np.ndarray:
     Returns:
         baseline: 基线数组
     """
-    x = spectrum.raman_shift
-    y = spectrum.intensity
-    coeffs = np.polyfit(x, y, degree)
-    return np.polyval(coeffs, x)
+    x, y = validate_spectrum_arrays(spectrum.raman_shift, spectrum.intensity)
+    degree = integer_parameter(degree, "degree")
+    if degree >= len(x):
+        raise ValueError("degree must be less than the number of data points")
+    if degree == 0:
+        return np.full_like(y, np.mean(y))
+    # Scale the x-domain before fitting, avoiding ill-conditioning at large offsets.
+    fitted = np.polynomial.Polynomial.fit(x, y, degree)
+    return fitted(x)
 
 
 def subtract_baseline(
@@ -89,6 +106,7 @@ def subtract_baseline(
     lam: float = 1e5,
     degree: int = 3,
     max_iter: int = 50,
+    tol: float = 1e-6,
 ) -> Spectrum:
     """对光谱进行基线校正.
 
@@ -102,8 +120,9 @@ def subtract_baseline(
     Returns:
         baseline-corrected Spectrum 对象
     """
+    validate_spectrum_arrays(spectrum.raman_shift, spectrum.intensity)
     if method == "arPLS":
-        baseline = arPLS(spectrum.intensity, lam=lam, max_iter=max_iter)
+        baseline = arPLS(spectrum.intensity, lam=lam, max_iter=max_iter, tol=tol)
     elif method == "poly":
         baseline = poly_baseline(spectrum, degree)
     else:

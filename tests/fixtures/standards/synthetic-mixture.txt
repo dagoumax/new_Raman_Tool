@@ -1,0 +1,13 @@
+# Raman Shift (cm^-1)	Intensity
+# Synthetic three triangular peaks over a constant background of 10 counts.
+1200 10
+1308 10
+1388 30
+1468 10
+1475 10
+1555 115
+1635 10
+2250 10
+2330 790
+2410 10
+2500 10
