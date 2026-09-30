@@ -41,7 +41,8 @@ def main():
         "raise SystemExit(main(['validate-standard', sys.argv[2]]))"
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", code, str(wheel),
+        # Isolated mode ignores PYTHONUTF8; enable UTF-8 explicitly for Windows logs.
+        [sys.executable, "-I", "-X", "utf8", "-c", code, str(wheel),
          str(root / "tests/fixtures/standards/synthetic-mixture.json")],
         timeout=60, check=False,
     )
